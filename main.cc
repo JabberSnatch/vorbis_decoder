@@ -16,7 +16,7 @@
 #include <unordered_map>
 #include <vector>
 
-enum class EDecodeState
+enum class EOggDecodeState
 {
     kError = 0,
     kCapturePattern,
@@ -59,7 +59,7 @@ int debug_PageCount = 0;
 
 OggContents DecodeOgg(unsigned char* _buff, std::size_t _size)
 {
-    EDecodeState decode_state = EDecodeState::kCapturePattern;
+    EOggDecodeState decode_state = EOggDecodeState::kCapturePattern;
     std::uint32_t decode_buff = 0u;
     OggContents pages;
     PageDesc current_page;
@@ -72,121 +72,93 @@ OggContents DecodeOgg(unsigned char* _buff, std::size_t _size)
         switch (decode_state)
         {
 
-        case EDecodeState::kCapturePattern:
+        case EOggDecodeState::kCapturePattern:
         {
             decode_buff = (decode_buff << 8u) | static_cast<std::uint32_t>(_buff[buff_index]);
             if (decode_buff == 0x4f676753u) // OggS
             {
                 current_page = PageDesc{};
-                decode_state = EDecodeState::kStreamStructureVersion;
+                decode_state = EOggDecodeState::kStreamStructureVersion;
                 decode_buff = 0u;
             }
         } break;
 
-        case EDecodeState::kStreamStructureVersion:
+        case EOggDecodeState::kStreamStructureVersion:
         {
             if (_buff[buff_index] == '\0')
             {
-                decode_state = EDecodeState::kHeaderType;
+                decode_state = EOggDecodeState::kHeaderType;
             }
             else
-                decode_state = EDecodeState::kError;
+                decode_state = EOggDecodeState::kError;
         } break;
 
-        case EDecodeState::kHeaderType:
+        case EOggDecodeState::kHeaderType:
         {
             if (!(_buff[buff_index] & 0xf0))
             {
-                current_page.header_type = static_cast<std::uint8_t>(_buff[buff_index]);
-                decode_state = EDecodeState::kGranulePosition;
+                current_page.header_type = *(std::uint8_t const*)(_buff + buff_index);
+                decode_state = EOggDecodeState::kGranulePosition;
             }
             else
-                decode_state = EDecodeState::kError;
+                decode_state = EOggDecodeState::kError;
         } break;
 
-        case EDecodeState::kGranulePosition:
+        case EOggDecodeState::kGranulePosition:
         {
             bytes_read = 8u;
             if (buff_index + bytes_read <= _size)
             {
-                std::uint64_t u_granule_position = 0u;
-                u_granule_position |= static_cast<std::uint64_t>(_buff[buff_index+0]) << 0;
-                u_granule_position |= static_cast<std::uint64_t>(_buff[buff_index+1]) << 8;
-                u_granule_position |= static_cast<std::uint64_t>(_buff[buff_index+2]) << 16;
-                u_granule_position |= static_cast<std::uint64_t>(_buff[buff_index+3]) << 24;
-                u_granule_position |= static_cast<std::uint64_t>(_buff[buff_index+4]) << 32;
-                u_granule_position |= static_cast<std::uint64_t>(_buff[buff_index+5]) << 40;
-                u_granule_position |= static_cast<std::uint64_t>(_buff[buff_index+6]) << 48;
-                u_granule_position |= static_cast<std::uint64_t>(_buff[buff_index+7]) << 56;
-                std::memcpy(&current_page.granule_position, &u_granule_position, bytes_read);
-
-                decode_state = EDecodeState::kStreamSerialNum;
+                current_page.granule_position = *(std::int64_t const*)(_buff + buff_index);
+                decode_state = EOggDecodeState::kStreamSerialNum;
             }
             else
-                decode_state = EDecodeState::kError;
+                decode_state = EOggDecodeState::kError;
         } break;
 
-        case EDecodeState::kStreamSerialNum:
+        case EOggDecodeState::kStreamSerialNum:
         {
             bytes_read = 4u;
             if (buff_index + bytes_read <= _size)
             {
-                std::uint32_t stream_serial_num = 0u;
-                stream_serial_num |= static_cast<std::uint32_t>(_buff[buff_index+0]) << 0*8;
-                stream_serial_num |= static_cast<std::uint32_t>(_buff[buff_index+1]) << 1*8;
-                stream_serial_num |= static_cast<std::uint32_t>(_buff[buff_index+2]) << 2*8;
-                stream_serial_num |= static_cast<std::uint32_t>(_buff[buff_index+3]) << 3*8;
-                current_page.stream_serial_num = stream_serial_num;
-
-                decode_state = EDecodeState::kPageSequenceNum;
+                current_page.stream_serial_num = *(std::uint32_t const*)(_buff + buff_index);
+                decode_state = EOggDecodeState::kPageSequenceNum;
             }
             else
-                decode_state = EDecodeState::kError;
+                decode_state = EOggDecodeState::kError;
         } break;
 
-        case EDecodeState::kPageSequenceNum:
+        case EOggDecodeState::kPageSequenceNum:
         {
             bytes_read = 4u;
             if (buff_index + bytes_read <= _size)
             {
-                std::uint32_t page_sequence_num = 0u;
-                page_sequence_num |= static_cast<std::uint32_t>(_buff[buff_index+0]) << 0*8;
-                page_sequence_num |= static_cast<std::uint32_t>(_buff[buff_index+1]) << 1*8;
-                page_sequence_num |= static_cast<std::uint32_t>(_buff[buff_index+2]) << 2*8;
-                page_sequence_num |= static_cast<std::uint32_t>(_buff[buff_index+3]) << 3*8;
-                current_page.page_sequence_num = page_sequence_num;
-
-                decode_state = EDecodeState::kPageChecksum;
+                current_page.page_sequence_num = *(std::uint32_t const*)(_buff + buff_index);
+                decode_state = EOggDecodeState::kPageChecksum;
             }
             else
-                decode_state = EDecodeState::kError;
+                decode_state = EOggDecodeState::kError;
         } break;
 
-        case EDecodeState::kPageChecksum:
+        case EOggDecodeState::kPageChecksum:
         {
             bytes_read = 4u;
             if (buff_index + bytes_read <= _size)
             {
-                std::uint32_t page_checksum = 0u;
-                page_checksum |= static_cast<std::uint32_t>(_buff[buff_index+0]) << 0*8;
-                page_checksum |= static_cast<std::uint32_t>(_buff[buff_index+1]) << 1*8;
-                page_checksum |= static_cast<std::uint32_t>(_buff[buff_index+2]) << 2*8;
-                page_checksum |= static_cast<std::uint32_t>(_buff[buff_index+3]) << 3*8;
-                current_page.page_checksum = page_checksum;
-
-                decode_state = EDecodeState::kPageSegments;
+                current_page.page_checksum = *(std::uint32_t const*)(_buff + buff_index);
+                decode_state = EOggDecodeState::kPageSegments;
             }
             else
-                decode_state = EDecodeState::kError;
+                decode_state = EOggDecodeState::kError;
         } break;
 
-        case EDecodeState::kPageSegments:
+        case EOggDecodeState::kPageSegments:
         {
             current_page.segment_count = static_cast<std::uint8_t>(_buff[buff_index]);
-            decode_state = EDecodeState::kSegmentTable;
+            decode_state = EOggDecodeState::kSegmentTable;
         } break;
 
-        case EDecodeState::kSegmentTable:
+        case EOggDecodeState::kSegmentTable:
         {
             bytes_read = current_page.segment_count;
             if (buff_index + bytes_read <= _size)
@@ -196,13 +168,13 @@ OggContents DecodeOgg(unsigned char* _buff, std::size_t _size)
                     current_page.segment_table[seg_index] = _buff[buff_index + seg_index];
                     current_page.debug_StreamSize += _buff[buff_index + seg_index];
                 }
-                decode_state = EDecodeState::kPacketData;
+                decode_state = EOggDecodeState::kPacketData;
             }
             else
-                decode_state = EDecodeState::kError;
+                decode_state = EOggDecodeState::kError;
         } break;
 
-        case EDecodeState::kPacketData:
+        case EOggDecodeState::kPacketData:
         {
             current_page.stream_begin = _buff + buff_index;
 
@@ -211,7 +183,7 @@ OggContents DecodeOgg(unsigned char* _buff, std::size_t _size)
                 emplace_info.first->second.emplace_back(current_page);
 
             bytes_read = 0u;
-            decode_state = EDecodeState::kCapturePattern;
+            decode_state = EOggDecodeState::kCapturePattern;
         } break;
 
         default: break;
@@ -223,17 +195,17 @@ OggContents DecodeOgg(unsigned char* _buff, std::size_t _size)
     return pages;
 }
 
-std::uint32_t FindVorbisSerialNumber(OggContents const& _ogg_contents)
+std::vector<std::uint32_t> GetVorbisSerials(OggContents const& _ogg_contents)
 {
-    std::uint32_t result = 0u;
+    std::vector<std::uint32_t> result{};
     for (std::pair<std::uint32_t const, PageContainer> const& pages_pair : _ogg_contents)
     {
         PageContainer const& pages = pages_pair.second;
         // PRE-CONDITION :
         // (pages.front().segment_count == 1)
         // (pages.front().header_type & PageDesc::FHeaderType::kFirstPage)
-        if (!std::strncmp((char const*)pages.front().stream_begin + 1, "vorbis", 6))
-            result = pages_pair.first;
+        if (!std::strncmp((char const*)pages.front().stream_begin, "\01vorbis", 7))
+            result.push_back(pages_pair.first);
     }
     return result;
 }
@@ -264,6 +236,9 @@ void PrintPages(PageContainer const &_pages)
 
 struct VorbisIDHeader
 {
+    std::size_t page_index;
+    std::size_t segment_index;
+
     static constexpr std::streamsize kSizeOnStream = 23u;
     // std::uint32_t vorbis_version; Should be '0' to be compatible
     std::uint8_t audio_channels;
@@ -276,30 +251,152 @@ struct VorbisIDHeader
     // + 1 bit framing flag (0x01 because bits are supposedly encoded one after the other)
 };
 
-void VorbisHeaders(PageContainer const &_pages, unsigned char const* _buff_base)
+enum class EVorbisDecodeState
 {
-    for (PageDesc const& page : _pages)
+    kIDHeader = 0,
+    kCommentHeader,
+    kSetupHeader,
+    kAudioDecode
+};
+
+enum EVorbisError
+{
+    kNoError = 0,
+    kMissingHeader,
+    kIncompleteHeader,
+    kInvalidIDHeader,
+};
+
+enum FInvalidIDHeader
+{
+    kVorbisVersion = 0x1,
+    kAudioChannels = 0x2,
+    kSampleRate = 0x4,
+    kBlocksize = 0x8,
+    kFramingBit = 0x10,
+};
+
+std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_header)
+{
+    EVorbisError error_code = EVorbisError::kNoError;
+    std::uint16_t error_flags = 0u;
+
+    EVorbisDecodeState decode_state = EVorbisDecodeState::kIDHeader;
+
+    //for (PageDesc const& page : _pages)
+    for (std::size_t page_index = 0u; page_index < _pages.size(); ++page_index)
     {
-        std::ptrdiff_t page_offset = (page.stream_begin - _buff_base);
-        std::cout << "Page offset " << std::hex << page_offset << std::endl;
-        std::cout << std::dec << (std::uint32_t)page.segment_count << " segments" << std::endl;
+        PageDesc const& page = _pages[page_index];
+
         std::ptrdiff_t segment_offset = 0;
-        for (int i = 0; i < page.segment_count; ++i)
+        for (std::size_t seg_index = 0;
+             seg_index < page.segment_count && error_code == EVorbisError::kNoError;
+             ++seg_index)
         {
-            if (page.segment_table[i] >= 7)
+            switch (decode_state)
             {
-                if (!std::strncmp((char const*)page.stream_begin + segment_offset, "\x01vorbis", 7))
-                    std::cout << "Vorbis ID header offset " << std::hex << page_offset + segment_offset << std::endl;
-                if (!std::strncmp((char const*)page.stream_begin + segment_offset, "\x03vorbis", 7))
-                    std::cout << "Vorbis comment header offset " << std::hex << page_offset + segment_offset << std::endl;
-                if (!std::strncmp((char const*)page.stream_begin + segment_offset, "\x05vorbis", 7))
-                    std::cout << "Vorbis setup header offset " << std::hex << page_offset + segment_offset << std::endl;
+            case EVorbisDecodeState::kIDHeader:
+            {
+                if (page.segment_table[seg_index] >= 7u &&
+                    !std::strncmp((char const*)page.stream_begin + segment_offset, "\x01vorbis", 7u))
+                {
+                    if (page.segment_table[seg_index] < VorbisIDHeader::kSizeOnStream + 7u)
+                    {
+                        error_code = EVorbisError::kIncompleteHeader;
+                        break;
+                    }
+
+                    unsigned char const* read_position = page.stream_begin + segment_offset + 7u;
+
+                    if (*(std::uint32_t const*)read_position != 0u)
+                    {
+                        error_code = EVorbisError::kInvalidIDHeader;
+                        error_flags |= FInvalidIDHeader::kVorbisVersion;
+                    }
+                    read_position += 4u;
+
+                    o_id_header.page_index = page_index;
+                    o_id_header.segment_index = seg_index;
+
+                    o_id_header.audio_channels = *read_position;
+                    read_position += 1u;
+
+                    o_id_header.audio_sample_rate = *(std::uint32_t const*)read_position;
+                    read_position += 4u;
+
+                    o_id_header.bitrate_max = *(std::int32_t const*)read_position;
+                    read_position += 4u;
+
+                    o_id_header.bitrate_nominal = *(std::int32_t const*)read_position;
+                    read_position += 4u;
+
+                    o_id_header.bitrate_min = *(std::int32_t const*)read_position;
+                    read_position += 4u;
+
+                    o_id_header.blocksize_0 = (*read_position) & 0xf;
+                    o_id_header.blocksize_1 = (*read_position) >> 4u;
+                    read_position += 1u;
+
+                    if (*read_position != 1u)
+                    {
+                        error_code = EVorbisError::kInvalidIDHeader;
+                        error_flags |= FInvalidIDHeader::kFramingBit;
+                    }
+
+                    if (!o_id_header.audio_channels)
+                    {
+                        error_code = EVorbisError::kInvalidIDHeader;
+                        error_flags |= FInvalidIDHeader::kAudioChannels;
+                    }
+                    if (!o_id_header.audio_sample_rate)
+                    {
+                        error_code = EVorbisError::kInvalidIDHeader;
+                        error_flags |= FInvalidIDHeader::kSampleRate;
+                    }
+                    if (o_id_header.blocksize_0 > o_id_header.blocksize_1)
+                    {
+                        error_code = EVorbisError::kInvalidIDHeader;
+                        error_flags |= FInvalidIDHeader::kBlocksize;
+                    }
+
+                    decode_state = EVorbisDecodeState::kCommentHeader;
+                }
+            } break;
+
+            case EVorbisDecodeState::kCommentHeader:
+            {
+                if (page.segment_table[seg_index] >= 7
+                    && !std::strncmp((char const*)page.stream_begin + segment_offset, "\x03vorbis", 7))
+                {
+                    std::cout << "Comment header found page " << page_index << " segment " << seg_index << std::endl;
+                    decode_state = EVorbisDecodeState::kSetupHeader;
+                }
+            } break;
+
+            case EVorbisDecodeState::kSetupHeader:
+            {
+                if (page.segment_table[seg_index] >= 7
+                    && !std::strncmp((char const*)page.stream_begin + segment_offset, "\x05vorbis", 7))
+                {
+                    std::cout << "Setup header found page " << page_index << " segment " << seg_index << std::endl;
+                    decode_state = EVorbisDecodeState::kAudioDecode;
+                }
+            } break;
+
+            default: break;
             }
 
-            segment_offset += page.segment_table[i];
+            segment_offset += page.segment_table[seg_index];
         }
-        std::cout << std::endl;
+
+        if (error_code != EVorbisError::kNoError)
+            break;
     }
+
+    if (error_code == EVorbisError::kNoError && decode_state != EVorbisDecodeState::kAudioDecode)
+        error_code = EVorbisError::kMissingHeader;
+
+    return error_code << 16u || error_flags;
 }
 
 int main(int argc, char** argv)
@@ -344,16 +441,33 @@ int main(int argc, char** argv)
 #endif
 
     OggContents const ogg_pages = DecodeOgg(buff.get(), static_cast<std::size_t>(file_size));
-    std::uint32_t const vorbis_serial = FindVorbisSerialNumber(ogg_pages);
-    if (!vorbis_serial)
+    std::vector<std::uint32_t> const vorbis_serials = GetVorbisSerials(ogg_pages);
+    if (vorbis_serials.empty())
     {
         std::cout << "No Vorbis frame found in file" << std::endl;
         return 1;
     }
 
-    std::cout << std::hex << vorbis_serial << std::endl;
-    VorbisHeaders(ogg_pages.at(vorbis_serial), buff.get());
-    //PrintPages(ogg_pages.at(vorbis_serial));
+#if 0
+    PrintPages(ogg_pages.at(vorbis_serials.front()));
+    return 0;
+#endif
+
+    std::cout << std::hex << vorbis_serials.front() << std::endl;
+
+    VorbisIDHeader id_header;
+    std::uint32_t res = VorbisHeaders(ogg_pages.at(vorbis_serials.front()), id_header);
+    if (res >> 16u != EVorbisError::kNoError)
+    {
+        std::cout << "Vorbis error" << std::endl;
+        // return 1;
+    }
+
+    std::cout << std::dec
+              << id_header.page_index << " " << id_header.segment_index << std::endl
+              << (unsigned)id_header.audio_channels << " " << id_header.audio_sample_rate << std::endl
+              << id_header.bitrate_max << " " << id_header.bitrate_nominal << " " << id_header.bitrate_min << std::endl
+              << (unsigned)id_header.blocksize_0 << " " << (unsigned)id_header.blocksize_1 << std::endl;
 
     return 0;
 }
