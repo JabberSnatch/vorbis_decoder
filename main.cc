@@ -57,6 +57,13 @@ using OggContents = std::unordered_map<std::uint32_t, PageContainer>;
 
 int debug_PageCount = 0;
 
+constexpr unsigned ilog(std::uint32_t _v)
+{
+    unsigned res = 0u;
+    for (; _v; _v = _v >> 1u, ++res);
+    return res;
+}
+
 OggContents DecodeOgg(unsigned char* _buff, std::size_t _size)
 {
     EOggDecodeState decode_state = EOggDecodeState::kCapturePattern;
@@ -251,12 +258,27 @@ struct VorbisIDHeader
     // + 1 bit framing flag (0x01 because bits are supposedly encoded one after the other)
 };
 
+struct VorbisCodebook
+{
+    enum class EDecodeState
+    {
+        kSyncPattern = 0,
+        kDimensions,
+        kEntryCount,
+        kCodewordLengths,
+    };
+
+    std::uint16_t dimensions;
+    std::uint32_t entry_count;
+    std::unique_ptr<std::uint8_t> entry_lengths;
+};
+
 enum class EVorbisDecodeState
 {
     kIDHeader = 0,
     kCommentHeader,
     kSetupHeader,
-    kAudioDecode
+    kAudioDecode,
 };
 
 enum EVorbisError
@@ -265,6 +287,7 @@ enum EVorbisError
     kMissingHeader,
     kIncompleteHeader,
     kInvalidIDHeader,
+    kInvalidSetupHeader,
 };
 
 enum FInvalidIDHeader
@@ -276,6 +299,184 @@ enum FInvalidIDHeader
     kFramingBit = 0x10,
 };
 
+EVorbisError VorbisCodebookSegmentDecode(unsigned char const* _segment_begin,
+                                         std::size_t _segment_size,
+                                         VorbisCodebook::EDecodeState &io_state,
+                                         VorbisCodebook &o_codebook)
+{
+    std::size_t seg_offset = 0u;
+    std::size_t bit_offset = 0u;
+    while (seg_offset < _segment_size)
+    {
+        std::size_t bytes_read = 1u;
+        switch (io_state)
+        {
+
+        case VorbisCodebook::EDecodeState::kSyncPattern:
+        {
+            if (seg_offset)
+            {
+                std::cout << "Debug abort (incomplete codebook decode)" << std::endl;
+                return EVorbisError::kInvalidSetupHeader;
+            }
+
+            bytes_read = 3u;
+            if (seg_offset + bytes_read < _segment_size)
+            {
+                if (((*(std::uint32_t const*)(_segment_begin + seg_offset)) & 0xffffffu) == 0x564342u)
+                    io_state = VorbisCodebook::EDecodeState::kDimensions;
+            }
+            else
+                return EVorbisError::kIncompleteHeader;
+        } break;
+
+        case VorbisCodebook::EDecodeState::kDimensions:
+        {
+            bytes_read = 2u;
+            if (seg_offset + bytes_read < _segment_size)
+            {
+                o_codebook.dimensions = *(std::uint16_t const*)(_segment_begin + seg_offset);
+                io_state = VorbisCodebook::EDecodeState::kEntryCount;
+            }
+            else
+                return EVorbisError::kIncompleteHeader;
+        } break;
+
+        case VorbisCodebook::EDecodeState::kEntryCount:
+        {
+            bytes_read = 3u;
+            if (seg_offset + bytes_read < _segment_size)
+            {
+                o_codebook.entry_count = *(std::uint32_t const*)(_segment_begin + seg_offset) & 0xffffffu;
+                o_codebook.entry_lengths.reset(new std::uint8_t[o_codebook.entry_count]);
+                io_state = VorbisCodebook::EDecodeState::kCodewordLengths;
+            }
+            else
+                return EVorbisError::kIncompleteHeader;
+        } break;
+
+        case VorbisCodebook::EDecodeState::kCodewordLengths:
+        {
+            std::size_t bit_offset = 0u;
+            bool ordered = (_segment_begin[seg_offset]) & 0x1u;
+            bit_offset = 1u;
+            if (!ordered)
+            {
+                std::cout << "unordered" << std::endl;
+                bool sparse = (_segment_begin[seg_offset]) & 0x2u;
+                bit_offset = 2u;
+
+                if (sparse)
+                {
+                    std::cout << "sparse" << std::endl;
+                    std::size_t debug_bitsRem = (2u + 6u * o_codebook.entry_count) & 0x7u;
+                    std::size_t debug_byteIndex = 0u;
+
+                    bytes_read = (2u + 6u * o_codebook.entry_count) >> 3u;
+                    if (seg_offset + bytes_read >= _segment_size)
+                        return EVorbisError::kIncompleteHeader;
+
+                    for (std::size_t entry_index = 0u; entry_index < o_codebook.entry_count; ++entry_index)
+                    {
+                        bit_offset = 2u + 6u * entry_index;
+                        std::size_t byte_index = seg_offset + (bit_offset >> 3u);
+                        bit_offset &= 0x7u;
+
+                        bool flag = (_segment_begin[byte_index]) & (1u << bit_offset);
+
+                        bit_offset += 1u;
+                        byte_index += bit_offset >> 3u;
+                        bit_offset &= 0x7u;
+
+                        std::uint8_t entry_length = 0u;
+                        if (flag)
+                        {
+                            entry_length = static_cast<std::uint8_t>(
+                                (*(std::uint16_t const*)(_segment_begin + byte_index)
+                                 >> bit_offset) & 0x1fu
+                            ) + 1u;
+
+                            bit_offset += 5u;
+                            byte_index += bit_offset >> 3u;
+                            bit_offset &= 0x7u;
+                        }
+
+                        o_codebook.entry_lengths.get()[entry_index] = entry_length;
+
+                        debug_byteIndex = byte_index;
+                    }
+
+                    std::cout << "debug_byteIndex " << (debug_byteIndex - seg_offset) << " " << bytes_read << std::endl;
+                    std::cout << "debug_bitsRem " << debug_bitsRem << " " << bit_offset << std::endl;
+                }
+                else
+                {
+                    bytes_read = (2u + 5u * o_codebook.entry_count) >> 3u;
+                    if (seg_offset + bytes_read >= _segment_size)
+                        return EVorbisError::kIncompleteHeader;
+
+                    for (std::size_t entry_index = 0u; entry_index < o_codebook.entry_count; ++entry_index)
+                    {
+                        bit_offset = 2u + 5u * entry_index;
+                        std::size_t byte_index = seg_offset + (bit_offset >> 3u);
+                        bit_offset &= 0x7u;
+
+                        std::uint8_t entry_length = static_cast<std::uint8_t>(
+                            (*(std::uint16_t const*)(_segment_begin + byte_index)
+                             >> bit_offset) & 0x1fu
+                        ) + 1u;
+                        o_codebook.entry_lengths.get()[entry_index] = entry_length;
+                    }
+                }
+            }
+            else
+            {
+                std::size_t byte_index = seg_offset;
+                std::uint32_t entry_index = 0u;
+
+                std::uint8_t current_length = static_cast<std::uint8_t>(
+                    (*(std::uint16_t const*)(_segment_begin + byte_index)
+                     >> bit_offset) & 0x1fu
+                ) + 1u;
+                bit_offset += 5u;
+                byte_index += bit_offset >> 3u;
+                bit_offset &= 0x7u;
+
+                while (entry_index < o_codebook.entry_count)
+                {
+                    std::size_t bits_read = ilog(o_codebook.entry_count - entry_index); // entry_count is 24 bits
+                    std::uint32_t entry_range =
+                        (*(std::uint32_t const*)(_segment_begin + byte_index)
+                         >> bit_offset) & ((1u << bits_read) - 1u);
+                    bit_offset += bits_read;
+                    byte_index += bit_offset >> 3u;
+                    bit_offset &= 0x7u;
+
+                    std::fill(o_codebook.entry_lengths.get() + entry_index,
+                              o_codebook.entry_lengths.get() + entry_index + entry_range,
+                              current_length);
+
+                    entry_index += entry_range;
+                    if (entry_index > o_codebook.entry_count)
+                        return EVorbisError::kInvalidSetupHeader;
+
+                    ++current_length;
+                }
+
+                bytes_read = byte_index - seg_offset;
+            }
+
+            io_state = VorbisCodebook::EDecodeState::kSyncPattern;
+        } break;
+
+        default: break;
+        }
+        seg_offset += bytes_read;
+    }
+
+    return EVorbisError::kNoError;
+}
+
 std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_header)
 {
     EVorbisError error_code = EVorbisError::kNoError;
@@ -283,7 +484,6 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
 
     EVorbisDecodeState decode_state = EVorbisDecodeState::kIDHeader;
 
-    //for (PageDesc const& page : _pages)
     for (std::size_t page_index = 0u; page_index < _pages.size(); ++page_index)
     {
         PageDesc const& page = _pages[page_index];
@@ -378,7 +578,26 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
                 if (page.segment_table[seg_index] >= 7
                     && !std::strncmp((char const*)page.stream_begin + segment_offset, "\x05vorbis", 7))
                 {
+                    unsigned char const* read_position = page.stream_begin + segment_offset + 7u;
+                    std::size_t const codebook_count = (std::size_t)(*read_position++) + 1u;
                     std::cout << "Setup header found page " << page_index << " segment " << seg_index << std::endl;
+
+                    VorbisCodebook::EDecodeState codebook_state = VorbisCodebook::EDecodeState::kSyncPattern;
+                    VorbisCodebook test_codebook{};
+                    error_code = VorbisCodebookSegmentDecode(read_position,
+                                                             page.segment_table[seg_index] - 8u,
+                                                             codebook_state,
+                                                             test_codebook);
+
+                    std::cout << "Codebook : " << std::endl
+                              << std::dec << test_codebook.dimensions << " "
+                              << std::dec << test_codebook.entry_count << std::endl;
+                    if (test_codebook.entry_lengths)
+                    {
+                        for (std::uint32_t entry_index = 0u; entry_index < test_codebook.entry_count; ++entry_index)
+                            std::cout << std::dec << (unsigned)test_codebook.entry_lengths.get()[entry_index] << " ";
+                        std::cout << std::endl;
+                    }
                     decode_state = EVorbisDecodeState::kAudioDecode;
                 }
             } break;
@@ -463,7 +682,8 @@ int main(int argc, char** argv)
         // return 1;
     }
 
-    std::cout << std::dec
+    std::cout << "ID header : " << std::endl
+              << std::dec
               << id_header.page_index << " " << id_header.segment_index << std::endl
               << (unsigned)id_header.audio_channels << " " << id_header.audio_sample_rate << std::endl
               << id_header.bitrate_max << " " << id_header.bitrate_nominal << " " << id_header.bitrate_min << std::endl
