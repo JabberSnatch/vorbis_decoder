@@ -56,6 +56,7 @@ using PageContainer = std::vector<PageDesc>;
 using OggContents = std::unordered_map<std::uint32_t, PageContainer>;
 
 int debug_PageCount = 0;
+unsigned char* debug_baseBuff;
 
 constexpr unsigned ilog(std::uint32_t _v)
 {
@@ -266,6 +267,7 @@ struct VorbisCodebook
         kDimensions,
         kEntryCount,
         kCodewordLengths,
+        kLookupTable,
     };
 
     std::uint16_t dimensions;
@@ -357,7 +359,6 @@ EVorbisError VorbisCodebookSegmentDecode(unsigned char const* _segment_begin,
 
         case VorbisCodebook::EDecodeState::kCodewordLengths:
         {
-            std::size_t bit_offset = 0u;
             bool ordered = (_segment_begin[seg_offset]) & 0x1u;
             bit_offset = 1u;
             if (!ordered)
@@ -366,22 +367,23 @@ EVorbisError VorbisCodebookSegmentDecode(unsigned char const* _segment_begin,
                 bool sparse = (_segment_begin[seg_offset]) & 0x2u;
                 bit_offset = 2u;
 
+                // =============================================================
+                // UNORDERED, SPARSE
+                // =============================================================
                 if (sparse)
                 {
                     std::cout << "sparse" << std::endl;
                     std::size_t debug_bitsRem = (2u + 6u * o_codebook.entry_count) & 0x7u;
                     std::size_t debug_byteIndex = 0u;
 
-                    bytes_read = (2u + 6u * o_codebook.entry_count) >> 3u;
+                    std::size_t const bits_read = 2u + 6u * o_codebook.entry_count;
+                    bytes_read = bits_read >> 3u;
                     if (seg_offset + bytes_read >= _segment_size)
                         return EVorbisError::kIncompleteHeader;
 
-                    for (std::size_t entry_index = 0u; entry_index < o_codebook.entry_count; ++entry_index)
+                    for (std::size_t entry_index = 0u, byte_index = seg_offset;
+                         entry_index < o_codebook.entry_count; ++entry_index)
                     {
-                        bit_offset = 2u + 6u * entry_index;
-                        std::size_t byte_index = seg_offset + (bit_offset >> 3u);
-                        bit_offset &= 0x7u;
-
                         bool flag = (_segment_begin[byte_index]) & (1u << bit_offset);
 
                         bit_offset += 1u;
@@ -406,29 +408,42 @@ EVorbisError VorbisCodebookSegmentDecode(unsigned char const* _segment_begin,
                         debug_byteIndex = byte_index;
                     }
 
+                    bit_offset = bits_read & 0x7u;
                     std::cout << "debug_byteIndex " << (debug_byteIndex - seg_offset) << " " << bytes_read << std::endl;
                     std::cout << "debug_bitsRem " << debug_bitsRem << " " << bit_offset << std::endl;
                 }
+
+                // =============================================================
+                // UNORDERED, DENSE
+                // =============================================================
                 else
                 {
-                    bytes_read = (2u + 5u * o_codebook.entry_count) >> 3u;
+                    std::size_t const bits_read = 2u + 5u * o_codebook.entry_count;
+                    bytes_read = bits_read >> 3u;
                     if (seg_offset + bytes_read >= _segment_size)
                         return EVorbisError::kIncompleteHeader;
 
-                    for (std::size_t entry_index = 0u; entry_index < o_codebook.entry_count; ++entry_index)
+                    for (std::size_t entry_index = 0u, byte_index = seg_offset;
+                         entry_index < o_codebook.entry_count; ++entry_index)
                     {
-                        bit_offset = 2u + 5u * entry_index;
-                        std::size_t byte_index = seg_offset + (bit_offset >> 3u);
-                        bit_offset &= 0x7u;
-
                         std::uint8_t entry_length = static_cast<std::uint8_t>(
                             (*(std::uint16_t const*)(_segment_begin + byte_index)
                              >> bit_offset) & 0x1fu
                         ) + 1u;
                         o_codebook.entry_lengths.get()[entry_index] = entry_length;
+
+                        bit_offset += 5u;
+                        byte_index += bit_offset >> 3u;
+                        bit_offset &= 0x7u;
                     }
+
+                    bit_offset = bits_read & 0x7u;
                 }
             }
+
+            // =================================================================
+            // ORDERED
+            // =================================================================
             else
             {
                 std::size_t byte_index = seg_offset;
@@ -466,12 +481,95 @@ EVorbisError VorbisCodebookSegmentDecode(unsigned char const* _segment_begin,
                 bytes_read = byte_index - seg_offset;
             }
 
+            io_state = VorbisCodebook::EDecodeState::kLookupTable;
+        } break;
+
+        case VorbisCodebook::EDecodeState::kLookupTable:
+        {
+            std::cout << std::hex << (unsigned)(_segment_begin - debug_baseBuff + 8u) << " "
+                      << std::hex << (unsigned)(_segment_begin - debug_baseBuff + seg_offset) << " "
+                      << std::dec << bit_offset << " "
+                      << std::hex << (unsigned)_segment_begin[seg_offset] << " "
+                      << std::hex << (unsigned)_segment_begin[seg_offset-1] << std::endl;
+
+            std::size_t byte_index = seg_offset;
+            std::uint8_t lookup_type = static_cast<std::uint8_t>(
+                (*(std::uint16_t const*)(_segment_begin + byte_index)
+                 >> bit_offset) & 0xfu
+            );
+            bit_offset += 4u;
+            byte_index += bit_offset >> 3u;
+            bit_offset &= 0x7u;
+
+            std::cout << (unsigned)lookup_type << std::endl;
+
+            if (lookup_type > 2u)
+                return EVorbisError::kInvalidSetupHeader;
+
+            if (lookup_type)
+            {
+                std::cout << "UNIMPLEMENTED LOOKUP TYPE " << lookup_type << std::endl;
+
+                std::uint32_t binary_min_value = static_cast<std::uint32_t>(
+                    (*(std::uint64_t const*)(_segment_begin + byte_index)
+                     >> bit_offset) & 0xffffffffu
+                );
+                byte_index += 4u;
+
+                std::uint32_t binary_exponent = binary_min_value & 0x7fe00000u;
+                std::uint32_t t0 = binary_exponent << 1u;
+                std::int32_t t1; memcpy(&t1, &t0, 4u);
+                t1 *= (1u << 2u);
+                std::uint32_t ieee_exponent; memcpy(&ieee_exponent, &t1, 4u);
+                ieee_exponent = (ieee_exponent >> 1u);
+                std::uint32_t ieee_min_value = (binary_min_value & 0x801fffffu) | ieee_exponent;
+                float yolo; memcpy(&yolo, &ieee_min_value, 4u);
+
+                std::cout << std::hex << binary_exponent << " " << ieee_exponent << std::endl;
+                std::cout << yolo << std::endl;
+
+                std::uint32_t binary_delta_value = static_cast<std::uint32_t>(
+                    (*(std::uint64_t const*)(_segment_begin + byte_index)
+                     >> bit_offset) & 0xffffffffu
+                );
+                byte_index += 4u;
+
+                binary_exponent = binary_delta_value & 0x7fe00000u;
+                t0 = binary_exponent << 1u;
+                memcpy(&t1, &t0, 4u);
+                t1 *= (1u << 2u);
+                memcpy(&ieee_exponent, &t1, 4u);
+                ieee_exponent = (ieee_exponent >> 1u);
+                std::uint32_t ieee_delta_value = (binary_delta_value & 0x801fffffu) | ieee_exponent;
+                memcpy(&yolo, &ieee_delta_value, 4u);
+
+                std::cout << std::hex << binary_exponent << " " << ieee_exponent << std::endl;
+                std::cout << yolo << std::endl;
+
+                if (lookup_type == 1u)
+                {
+                }
+                else
+                {
+                }
+            }
+
+            std::uint32_t test_value = static_cast<std::uint32_t>(
+                (*(std::uint64_t const*)(_segment_begin + byte_index)
+                 >> bit_offset) & 0xffffffu
+            );
+
+            std::cout << std::hex << "yolo " << test_value << std::endl;
+
             io_state = VorbisCodebook::EDecodeState::kSyncPattern;
         } break;
 
         default: break;
         }
         seg_offset += bytes_read;
+
+        if (seg_offset > _segment_size + 1)
+            std::cout << "Segment overstep" << std::endl;
     }
 
     return EVorbisError::kNoError;
@@ -581,6 +679,7 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
                     unsigned char const* read_position = page.stream_begin + segment_offset + 7u;
                     std::size_t const codebook_count = (std::size_t)(*read_position++) + 1u;
                     std::cout << "Setup header found page " << page_index << " segment " << seg_index << std::endl;
+                    std::cout << "Codebook count : " << std::dec << codebook_count << std::endl;
 
                     VorbisCodebook::EDecodeState codebook_state = VorbisCodebook::EDecodeState::kSyncPattern;
                     VorbisCodebook test_codebook{};
@@ -647,6 +746,7 @@ int main(int argc, char** argv)
 
         std::cout << file_size << std::endl;
     }
+    debug_baseBuff = buff.get();
 
 #ifdef SHOW_FIRST_KB
     for (int i = 0; i < 1024 && i < file_size; ++i)
