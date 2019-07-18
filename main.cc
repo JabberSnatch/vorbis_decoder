@@ -277,6 +277,7 @@ enum class EVorbisDecodeState
 enum EVorbisError
 {
     kNoError = 0,
+    kInvalidStream,
     kEndOfStream,
 
     kMissingHeader,
@@ -294,6 +295,43 @@ enum FInvalidIDHeader
     kFramingBit = 0x10,
 };
 
+
+std::uint32_t PackError(EVorbisError _code, std::uint16_t _flags)
+{
+    return _code << 16u | _flags;
+}
+
+EVorbisError ComputePacketSize(PageContainer const& _pages,
+                               std::size_t _page_index,
+                               std::size_t _seg_index,
+                               std::size_t &o_packet_size,
+                               std::size_t &o_page_end,
+                               std::size_t &o_seg_end)
+{
+    o_page_end = _page_index;
+    o_seg_end = _seg_index;
+    o_packet_size = 0u;
+
+    while (_pages[_page_index].segment_table[_seg_index] == 255u)
+    {
+        o_packet_size += _pages[_page_index].segment_table[_seg_index++];
+        if (_seg_index >= _pages[_page_index].segment_count)
+            if (++_page_index >= _pages.size())
+                return EVorbisError::kInvalidStream;
+    }
+
+    o_packet_size += _pages[_page_index].segment_table[_seg_index];
+    o_page_end = _page_index;
+    o_seg_end = _seg_index + 1;
+
+    if (o_page_end < _pages.size() && o_seg_end == _pages[o_page_end].segment_count)
+    {
+        o_page_end++;
+        o_seg_end = 0u;
+    }
+
+    return EVorbisError::kNoError;
+}
 
 std::uint32_t ReadBits(int _count,
                        std::uint8_t const* &_base_address,
@@ -346,6 +384,8 @@ EVorbisError VorbisCodebookDecode(std::uint8_t const* &_base_address,
                                   int &_remaining_bits,
                                   VorbisCodebook &o_codebook)
 {
+    std::cout << "Remaining bits " << _remaining_bits << std::endl;
+
     if (_remaining_bits < 24)
         return EVorbisError::kIncompleteHeader;
     _remaining_bits -= 24;
@@ -372,7 +412,6 @@ EVorbisError VorbisCodebookDecode(std::uint8_t const* &_base_address,
 
     if (!ordered)
     {
-        std::cout << "unordered" << std::endl;
         if (!_remaining_bits)
             return EVorbisError::kIncompleteHeader;
         _remaining_bits -= 1;
@@ -381,13 +420,27 @@ EVorbisError VorbisCodebookDecode(std::uint8_t const* &_base_address,
         if (sparse)
         {
             std::cout << "sparse" << std::endl;
+#if 0
             if (_remaining_bits < 6 * o_codebook.entry_count)
+            {
+                std::cout << "Out bits " << _remaining_bits << std::endl;
+                std::cout << "Need bits " << 6 * o_codebook.entry_count << std::endl;
                 return EVorbisError::kIncompleteHeader;
+            }
             _remaining_bits -= 6 * o_codebook.entry_count;
+#endif
 
             for (std::size_t entry_index = 0u;
                  entry_index < o_codebook.entry_count; ++entry_index)
             {
+                if (_remaining_bits < 6)
+                {
+                    std::cout << "Out bits " << std::dec << _remaining_bits << " "
+                              << std::hex << (unsigned)(*_base_address & (~0u & !(1u << (8u - _remaining_bits)))) << std::endl;
+                    return EVorbisError::kIncompleteHeader;
+                }
+                _remaining_bits -= 6;
+
                 bool flag = ReadBits(1, _base_address, _bit_offset);
 
                 o_codebook.entry_lengths.get()[entry_index] = flag
@@ -439,10 +492,14 @@ EVorbisError VorbisCodebookDecode(std::uint8_t const* &_base_address,
         }
     }
 
+    std::cout << "Remaining bits " << (unsigned)_remaining_bits << std::endl;
+
     if (_remaining_bits < 4)
         return EVorbisError::kIncompleteHeader;
     _remaining_bits -= 4;
     std::uint8_t const lookup_type = (std::uint8_t)ReadBits(4, _base_address, _bit_offset);
+
+    std::cout << "Lookup type " << (unsigned)lookup_type << std::endl;
 
     if (lookup_type > 2u)
         return EVorbisError::kInvalidSetupHeader;
@@ -506,11 +563,102 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
     EVorbisError error_code = EVorbisError::kNoError;
     std::uint16_t error_flags = 0u;
 
+    std::size_t page_index = 0u;
+    std::size_t seg_index = 0u;
+
+    {
+        std::size_t packet_size = _pages[page_index].segment_table[seg_index];
+
+        if (packet_size == 255u)
+            return PackError(EVorbisError::kMissingHeader, 0u);
+
+        if (std::strncmp((char const*)_pages[page_index].stream_begin, "\x01vorbis", 7u))
+            return PackError(EVorbisError::kMissingHeader, 0u);
+
+        if (packet_size < VorbisIDHeader::kSizeOnStream + 7u)
+            return PackError(EVorbisError::kIncompleteHeader, 0u);
+        if (packet_size > VorbisIDHeader::kSizeOnStream + 7u)
+            std::cout << "[WARNING] Unexpected size for Vorbis ID header" << std::endl;
+
+        std::uint8_t const* read_position = _pages[page_index].stream_begin + 7u;
+        std::uint16_t error_flags = 0u;
+
+        o_id_header.page_index = page_index;
+        o_id_header.segment_index = seg_index;
+
+        if (*(std::uint32_t const*)read_position != 0u)
+            error_flags |= FInvalidIDHeader::kVorbisVersion;
+        read_position += 4u;
+
+        o_id_header.audio_channels = *read_position;
+        read_position += 1u;
+
+        o_id_header.audio_sample_rate = *(std::uint32_t const*)read_position;
+        read_position += 4u;
+
+        o_id_header.bitrate_max = *(std::int32_t const*)read_position;
+        read_position += 4u;
+
+        o_id_header.bitrate_nominal = *(std::int32_t const*)read_position;
+        read_position += 4u;
+
+        o_id_header.bitrate_min = *(std::int32_t const*)read_position;
+        read_position += 4u;
+
+        o_id_header.blocksize_0 = (*read_position) & 0xf;
+        o_id_header.blocksize_1 = (*read_position) >> 4u;
+        read_position += 1u;
+
+        if (*read_position != 1u)
+            error_flags |= FInvalidIDHeader::kFramingBit;
+        if (!o_id_header.audio_channels)
+            error_flags |= FInvalidIDHeader::kAudioChannels;
+        if (!o_id_header.audio_sample_rate)
+            error_flags |= FInvalidIDHeader::kSampleRate;
+        if (o_id_header.blocksize_0 > o_id_header.blocksize_1)
+            error_flags |= FInvalidIDHeader::kBlocksize;
+
+        if (error_flags)
+            return PackError(EVorbisError::kInvalidIDHeader, error_flags);
+
+        if (++seg_index == _pages[page_index].segment_count)
+        {
+            ++page_index;
+            seg_index = 0u;
+        }
+    }
+
+    std::cout << "Page index " << page_index << " segment index " << seg_index << std::endl;
+
+    {
+        std::size_t packet_size, page_end, seg_end;
+        error_code = ComputePacketSize(_pages, page_index, seg_index,
+                                       packet_size, page_end, seg_end);
+        if (error_code != EVorbisError::kNoError)
+            return PackError(error_code, 0u);
+
+        std::cout << "Page end " << page_end << " segment end " << seg_end << std::endl;
+
+        if (std::strncmp((char const*)_pages[page_index].stream_begin, "\x03vorbis", 7))
+            return PackError(EVorbisError::kMissingHeader, 0u);
+
+        std::cout << "Comment header found page " << page_index << " segment " << seg_index << std::endl;
+        std::cout << "Size is " << packet_size << " bytes" << std::endl;
+
+        page_index = page_end;
+        seg_index = seg_end;
+    }
+
+    return 0u;
+
     EVorbisDecodeState decode_state = EVorbisDecodeState::kIDHeader;
 
     for (std::size_t page_index = 0u; page_index < _pages.size(); ++page_index)
     {
         PageDesc const& page = _pages[page_index];
+
+        std::cout << "Page size "
+                  << std::dec << page.debug_StreamSize << std::endl;
 
         std::ptrdiff_t segment_offset = 0;
         for (std::size_t seg_index = 0;
@@ -619,6 +767,7 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
 
                     int bit_offset = 0;
                     int remaining_bits = (page.segment_table[seg_index] - 8) * 8;
+                    std::cout << "Page size " << (unsigned)page.segment_table[seg_index] << std::endl;
                     while (error_code == EVorbisError::kNoError && codebook_index++ < codebook_count)
                     {
                         error_code = VorbisCodebookDecode(read_position,
@@ -718,7 +867,7 @@ int main(int argc, char** argv)
     std::uint32_t res = VorbisHeaders(ogg_pages.at(vorbis_serials.front()), id_header);
     if (res >> 16u != EVorbisError::kNoError)
     {
-        std::cout << "Vorbis error" << std::endl;
+        std::cout << "Vorbis error " << (res >> 16u) << std::endl;
         // return 1;
     }
 
