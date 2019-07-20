@@ -50,7 +50,7 @@ struct PageDesc
     std::uint8_t segment_table[256];
     unsigned debug_StreamSize = 0u;
 
-    std::uint8_t* stream_begin = nullptr;
+    std::uint8_t const* stream_begin = nullptr;
 };
 
 using PageContainer = std::vector<PageDesc>;
@@ -66,7 +66,24 @@ constexpr unsigned ilog(std::uint32_t _v)
     return res;
 }
 
-OggContents DecodeOgg(std::uint8_t* _buff, std::size_t _size)
+constexpr std::uint32_t lookup1_values(std::uint32_t _entry_count, std::uint16_t _dimensions)
+{
+    if (_dimensions == 0u)
+        return 0u;
+    if (_dimensions == 1u)
+        return _entry_count;
+    if (_dimensions == 2u)
+        return static_cast<std::uint32_t>(std::floor(std::sqrt(_entry_count)));
+
+    float const f_entry_count = (float)_entry_count;
+    float const f_dimensions = (float)_dimensions;
+    float f_result = 1.f;
+    while (std::pow(f_result, f_dimensions) <= f_entry_count)
+        f_result += 1.f; // NOTE: _entry_count should be 24 bits
+    return static_cast<std::uint32_t>(f_result) - 1u;
+}
+
+OggContents DecodeOgg(std::uint8_t const* _buff, std::size_t _size)
 {
     EOggDecodeState decode_state = EOggDecodeState::kCapturePattern;
     std::uint32_t decode_buff = 0u;
@@ -499,79 +516,81 @@ EVorbisError VorbisCodebookDecode(std::uint8_t const* &_base_address,
 
     if (lookup_type)
     {
-        std::cout << "UNIMPLEMENTED LOOKUP TYPE " << std::dec << (unsigned)lookup_type << std::endl;
+        // N.0 * 2^(E - 788) <=> 1.m * 2^(e - 127) * 2^X
+        // 1m.0 * 2^-23 * 2^(e-127) * 2^X
+        // 1m.0 * 2^(e - 150) * 2^X
+        // N.0 * 2^(E - 788) <=> 1m.0 * 2^(e - 150) * 2^X
 
-#if 0
+        // E - 788 = e - 150
+        // e = E - 638
+
+        // N = 1m.0 * 2^X
+        // log(N) = log(1m.0) + log(2^X)
+        // log(N) = 24 + X (log(1m.0) is known to be 24 in IEEE754 binary32)
+        // log(N) - 24 = X
+        // 1m.0 = N / 2^X
+
+        auto float32_unpack = [](std::uint32_t _v) -> float
+        {
+            std::uint32_t const mantissa = _v & 0x1fffffu;
+            std::uint32_t const sign = _v & 0x80000000u;
+            std::uint32_t const exponent = (_v & 0x7fe00000u) >> 21;
+
+            float ref = (float)mantissa * std::pow(2.f, (float)exponent - 788.f) * (sign ? -1.f : 1.f);
+
+            int X = (int)ilog(mantissa) - 24;
+            std::uint32_t const ieee_exp = exponent - 638 + X;
+            std::uint32_t const ieee_sig = ((X < 0) ? (mantissa << -X) : (mantissa >> X))
+                & ((1u << 23) - 1);
+
+            std::uint32_t const ieee_bin = sign | (ieee_exp << 23u) | ieee_sig;
+            float res; memcpy(&res, &ieee_bin, 4u);
+
+            if (ref != res)
+                std::cout << "[WARNING] incorrect float32_unpack" << std::endl;
+            return res;
+        };
+
+        if (_remaining_bits < 32)
+            return EVorbisError::kIncompleteHeader;
+        _remaining_bits -= 32;
         std::uint32_t binary_min_value = ReadBits(32, _base_address, _bit_offset);
+        float min_value = float32_unpack(binary_min_value);
 
-        std::uint32_t binary_exponent = binary_min_value & 0x7fe00000u;
-        std::uint32_t t0 = binary_exponent << 1u;
-        std::int32_t t1; memcpy(&t1, &t0, 4u);
-        t1 *= (1u << 2u);
-        std::uint32_t ieee_exponent; memcpy(&ieee_exponent, &t1, 4u);
-        ieee_exponent = (ieee_exponent >> 1u);
-        std::uint32_t ieee_min_value = (binary_min_value & 0x801fffffu) | ieee_exponent;
-        float yolo; memcpy(&yolo, &ieee_min_value, 4u);
-
-        std::cout << std::hex << binary_exponent << " " << ieee_exponent << std::endl;
-        std::cout << yolo << std::endl;
-
-        {
-            std::uint32_t mantissa = binary_min_value & 0x1fffffu;
-            std::uint32_t sign = binary_min_value & 0x80000000u;
-            std::uint32_t exponent = (binary_min_value & 0x7fe00000u) >> 21;
-            float ref = (float)mantissa * std::pow(2.f, (float)exponent - 788.f) * (sign ? -1.f : 1.f);
-            std::cout << std::dec << ref << std::endl;
-            std::uint32_t ref_bin; memcpy(&ref_bin, &ref, 4);
-            std::cout << std::hex << ref_bin << std::endl;
-            std::cout << std::dec << exponent << std::endl;
-
-            bool exponent_sign = exponent & 0x200u;
-            /*
-            if (exponent_sign)
-                exponent = ((exponent & ~0x380u) >> 2) | 0x80u;
-            else
-                exponent = (exponent & ~0x380u) >> 2;
-            */
-            exponent = (exponent - 788) & 0xffu;
-            std::uint32_t exp_bin = sign | (exponent << 23u) | (mantissa << 2u);
-            float exp; memcpy(&exp, &exp_bin, 4u);
-            std::cout << std::dec << exp << std::endl;
-            std::cout << std::hex << exp_bin << std::endl;
-            std::cout << std::dec << exponent << std::endl;
-        }
-
+        if (_remaining_bits < 32)
+            return EVorbisError::kIncompleteHeader;
+        _remaining_bits -= 32;
         std::uint32_t binary_delta_value = ReadBits(32, _base_address, _bit_offset);
+        float delta_value = float32_unpack(binary_delta_value);
 
-        binary_exponent = binary_delta_value & 0x7fe00000u;
-        t0 = binary_exponent << 1u;
-        memcpy(&t1, &t0, 4u);
-        t1 *= (1u << 2u);
-        memcpy(&ieee_exponent, &t1, 4u);
-        ieee_exponent = (ieee_exponent >> 1u);
-        std::uint32_t ieee_delta_value = (binary_delta_value & 0x801fffffu) | ieee_exponent;
-        memcpy(&yolo, &ieee_delta_value, 4u);
+        std::cout << "Min value " << min_value << std::endl;
+        std::cout << "Delta value " << delta_value << std::endl;
 
-        std::cout << std::hex << binary_exponent << " " << ieee_exponent << std::endl;
-        std::cout << yolo << std::endl;
+        if (_remaining_bits < 4)
+            return EVorbisError::kIncompleteHeader;
+        _remaining_bits -= 4;
+        std::uint8_t value_bit_count = (std::uint8_t)ReadBits(4, _base_address, _bit_offset) + 1u;
 
-        {
-            std::uint32_t mantissa = binary_delta_value & 0x1fffffu;
-            std::uint32_t sign = binary_delta_value & 0x80000000u;
-            std::uint32_t exponent = (binary_delta_value & 0x7fe00000u) >> 21;
-            float ref = (float)mantissa * std::pow(2.f, (float)exponent - 788.f) * (sign ? -1.f : 1.f);
-            std::cout << ref << std::endl;
-        }
+        if (!_remaining_bits)
+            return EVorbisError::kIncompleteHeader;
+        --_remaining_bits;
+        bool sequence_p = !!ReadBits(1, _base_address, _bit_offset);
 
+        std::uint32_t value_count = 0u;
         if (lookup_type == 1u)
-        {
-        }
+            value_count = lookup1_values(o_codebook.entry_count, o_codebook.dimensions);
         else
-        {
-        }
-#endif
+            value_count = o_codebook.entry_count * o_codebook.dimensions;
 
-        return EVorbisError::kIncompleteHeader;
+        std::vector<std::uint16_t> multiplicands;
+        multiplicands.reserve(value_count);
+        for (std::uint32_t value_index = 0u; value_index < value_count; ++value_index)
+        {
+            if (_remaining_bits < value_bit_count)
+                return EVorbisError::kIncompleteHeader;
+            _remaining_bits -= value_bit_count;
+            multiplicands.emplace_back((std::uint16_t)ReadBits(value_bit_count, _base_address, _bit_offset));
+        }
     }
 
     return EVorbisError::kNoError;
@@ -703,7 +722,7 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
 
             VorbisCodebook const& codebook = codebooks[codebook_index];
 
-#if 0
+#if 1
             std::cout << "Codebook " << std::dec << codebook_index << std::endl
                       << std::dec << codebook.dimensions << " "
                       << std::dec << codebook.entry_count << std::endl;
@@ -715,6 +734,7 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
             std::cout << std::endl;
 #endif
         }
+        std::cout << "Remaining bits " << remaining_bits << std::endl;
 
         page_index = page_end;
         seg_index = seg_end;
