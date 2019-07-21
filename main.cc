@@ -736,11 +736,192 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
         }
         std::cout << "Remaining bits " << remaining_bits << std::endl;
 
-        page_index = page_end;
-        seg_index = seg_end;
-
         if (error_code != EVorbisError::kNoError)
             return PackError(error_code, 0u);
+
+        if (remaining_bits < 6)
+            return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+        remaining_bits -= 6;
+        std::uint8_t vorbis_time_count = (std::uint8_t)ReadBits(6, read_position, bit_offset) + 1u;
+        for (std::uint8_t vorbis_time_index = 0u;
+             vorbis_time_index < vorbis_time_count; ++vorbis_time_index)
+        {
+            if (remaining_bits < 16)
+                return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+            remaining_bits -= 16;
+            std::uint16_t v = (std::uint16_t)ReadBits(16, read_position, bit_offset);
+            if (v)
+                return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+        }
+
+        if (remaining_bits < 6)
+            return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+        remaining_bits -= 6;
+        std::uint8_t vorbis_floor_count = (std::uint8_t)ReadBits(6, read_position, bit_offset) + 1u;
+        std::cout << std::dec << "floor count " << (unsigned)vorbis_floor_count << std::endl;
+        for (std::uint8_t floor_index = 0u;
+             floor_index < vorbis_floor_count; ++floor_index)
+        {
+            if (remaining_bits < 16)
+                return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+            remaining_bits -= 6;
+            std::uint16_t vorbis_floor_type = (std::uint16_t)ReadBits(16, read_position, bit_offset);
+            std::cout << std::dec << "floor type " << (unsigned)vorbis_floor_type << std::endl;
+
+            if (vorbis_floor_type == 0u)
+            {
+                std::cout << "[WARNING] floor0 detected, anything may happen" << std::endl;
+
+                if (remaining_bits < 8)
+                    return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                remaining_bits -= 8;
+                std::uint8_t floor0_order = (std::uint8_t)ReadBits(8, read_position, bit_offset);
+
+                if (remaining_bits < 16)
+                    return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                remaining_bits -= 16;
+                std::uint16_t floor0_rate = (std::uint16_t)ReadBits(16, read_position, bit_offset);
+
+                if (remaining_bits < 16)
+                    return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                remaining_bits -= 16;
+                std::uint16_t floor0_bark_map_size = (std::uint16_t)ReadBits(16, read_position, bit_offset);
+
+                if (remaining_bits < 6)
+                    return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                remaining_bits -= 6;
+                std::uint8_t floor0_amplitude_bits = (std::uint8_t)ReadBits(6, read_position, bit_offset);
+
+                if (remaining_bits < 8)
+                    return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                remaining_bits -= 8;
+                std::uint8_t floor0_amplitude_offset = (std::uint8_t)ReadBits(8, read_position, bit_offset);
+
+                if (remaining_bits < 4)
+                    return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                remaining_bits -= 4;
+                std::uint8_t floor0_book_count = (std::uint8_t)ReadBits(4, read_position, bit_offset) + 1u;
+
+                for (std::uint8_t book_index = 0u;
+                     book_index < floor0_book_count; ++book_index)
+                {
+                    if (remaining_bits < 8)
+                        return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                    remaining_bits -= 8;
+                    std::uint8_t codebook_index = (std::uint8_t)ReadBits(8, read_position, bit_offset);
+                    std::cout << std::dec << "codebook index " << (unsigned)codebook_index << std::endl;
+                }
+            }
+
+            else if (vorbis_floor_type == 1u)
+            {
+                if (remaining_bits < 5)
+                    return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                remaining_bits -= 5;
+                std::uint8_t floor1_partition_count = (std::uint8_t)ReadBits(5, read_position, bit_offset);
+
+                int maximum_class = -1;
+                std::vector<std::uint8_t> floor1_partition_classes(floor1_partition_count);
+                for (std::uint8_t partition_index = 0u;
+                     partition_index < floor1_partition_count;
+                     ++partition_index)
+                {
+                    if (remaining_bits < 4)
+                        return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                    remaining_bits -= 4;
+                    floor1_partition_classes[partition_index] = (std::uint8_t)ReadBits(4, read_position, bit_offset);
+                    maximum_class = std::max(maximum_class, (int)floor1_partition_classes[partition_index]);
+                }
+
+                std::vector<std::uint8_t> floor1_class_dimensions(maximum_class + 1);
+                for (int class_index = 0;
+                     class_index <= maximum_class; ++class_index)
+                {
+                    if (remaining_bits < 3)
+                        return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                    remaining_bits -= 3;
+                    floor1_class_dimensions[class_index] = (std::uint8_t)ReadBits(3, read_position, bit_offset) + 1u;
+
+                    if (remaining_bits < 2)
+                        return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                    remaining_bits -= 2;
+                    std::uint8_t floor1_class_subclass_logcount =
+                        (std::uint8_t)ReadBits(2, read_position, bit_offset);
+
+                    std::uint8_t floor1_class_masterbook_count = 0u;
+                    if (floor1_class_subclass_logcount)
+                    {
+                        if (remaining_bits < 8)
+                            return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                        remaining_bits -= 8;
+                        floor1_class_masterbook_count = (std::uint8_t)ReadBits(8, read_position, bit_offset);
+                    }
+
+                    std::vector<std::uint8_t> floor1_subclass_books((1u << floor1_class_subclass_logcount));
+                    for (std::size_t subclass_index = 0u;
+                         subclass_index < floor1_subclass_books.size();
+                         ++subclass_index)
+                    {
+                        if (remaining_bits < 8)
+                            return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                        remaining_bits -= 8;
+                        floor1_subclass_books[subclass_index] =
+                            (std::uint8_t)ReadBits(8, read_position, bit_offset) - 1u;
+                    }
+                }
+
+                if (remaining_bits < 2)
+                    return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                remaining_bits -= 2;
+                std::uint8_t floor1_multiplier = (std::uint8_t)ReadBits(2, read_position, bit_offset) + 1u;
+
+                if (remaining_bits < 4)
+                    return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                remaining_bits -= 4;
+                std::uint8_t range_bits = (std::uint8_t)ReadBits(4, read_position, bit_offset);
+
+                unsigned floor1_value_count = 2u;
+                for (std::size_t partition_index = 0u;
+                     partition_index < floor1_partition_classes.size();
+                     ++partition_index)
+                {
+                    std::uint8_t class_index = floor1_partition_classes[partition_index];
+                    std::uint8_t dimension_count = floor1_class_dimensions[class_index];
+                    floor1_value_count += dimension_count;
+                }
+
+                std::vector<std::uint16_t> floor1_Xs(floor1_value_count);
+                floor1_Xs[0] = 0u;
+                floor1_Xs[1] = (1u << range_bits);
+                std::size_t floor1_value_index = 2u;
+                for (std::size_t partition_index = 0u;
+                     partition_index < floor1_partition_count;
+                     ++partition_index)
+                {
+                    std::uint8_t class_index = floor1_partition_classes[partition_index];
+                    std::uint8_t dimension_count = floor1_class_dimensions[class_index];
+
+                    for (std::uint8_t dimension_index = 0u;
+                         dimension_index < dimension_count;
+                         ++dimension_index)
+                    {
+                        if (remaining_bits < range_bits)
+                            return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                        remaining_bits -= range_bits;
+                        floor1_Xs[floor1_value_index++] =
+                            (std::uint16_t)ReadBits(range_bits, read_position, bit_offset);
+                    }
+                }
+            }
+
+            else
+                return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+        }
+
+        std::cout << "Remaining bits " << remaining_bits << std::endl;
+
+        page_index = page_end;
+        seg_index = seg_end;
     }
 
     return 0u;
