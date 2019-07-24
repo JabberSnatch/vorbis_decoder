@@ -705,12 +705,20 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
         std::cout << std::dec << "Size is " << packet_size << " bytes" << std::endl;
 
         std::uint8_t const* read_position = _pages[page_index].stream_begin + stream_offset + 7u;
-        std::size_t const codebook_count = (std::size_t)(*read_position++) + 1u;
+        int bit_offset = 0;
+        int remaining_bits = (packet_size - 8) * 8;
+
+        // =====================================================================
+        // CODEBOOKS
+        // =====================================================================
+
+        if (remaining_bits < 8)
+            return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+        remaining_bits -= 8;
+        std::size_t const codebook_count = 1u + (std::size_t)ReadBits(8, read_position, bit_offset);
 
         std::cout << std::dec << "Codebook count " << codebook_count << std::endl;
         std::vector<VorbisCodebook> codebooks(codebook_count);
-        int bit_offset = 0;
-        int remaining_bits = (packet_size - 8) * 8;
         for (std::size_t codebook_index = 0u;
              error_code == EVorbisError::kNoError && codebook_index < codebook_count;
              ++codebook_index)
@@ -738,6 +746,10 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
 
         if (error_code != EVorbisError::kNoError)
             return PackError(error_code, 0u);
+
+        // =====================================================================
+        // FLOORS
+        // =====================================================================
 
         if (remaining_bits < 6)
             return PackError(EVorbisError::kInvalidSetupHeader, 0u);
@@ -915,6 +927,224 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
             }
 
             else
+                return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+        }
+
+        std::cout << "Remaining bits " << remaining_bits << std::endl;
+
+        // =====================================================================
+        // RESIDUES
+        // =====================================================================
+
+        if (remaining_bits < 6)
+            return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+        remaining_bits -= 6;
+        std::uint8_t residue_count = (std::uint8_t)ReadBits(6, read_position, bit_offset);
+
+        std::cout << "Residue count " << std::dec << (unsigned)residue_count << std::endl;
+
+        for (std::uint8_t residue_index = 0u;
+             residue_index < residue_count; ++residue_index)
+        {
+            if (remaining_bits < 16)
+                return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+            remaining_bits -= 16;
+            std::uint16_t residue_type = (std::uint16_t)ReadBits(16, read_position, bit_offset);
+
+            if (residue_type > 2)
+                return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+
+            if (remaining_bits < 24)
+                return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+            remaining_bits -= 24;
+            std::uint32_t residue_begin = ReadBits(24, read_position, bit_offset);
+
+            if (remaining_bits < 24)
+                return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+            remaining_bits -= 24;
+            std::uint32_t residue_end = ReadBits(24, read_position, bit_offset);
+
+            if (remaining_bits < 24)
+                return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+            remaining_bits -= 24;
+            std::uint32_t residue_partition_size = 1u + ReadBits(24, read_position, bit_offset);
+
+            if (remaining_bits < 6)
+                return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+            remaining_bits -= 6;
+            std::uint8_t residue_classif_count = 1u + (std::uint8_t)ReadBits(6, read_position, bit_offset);
+
+            if (remaining_bits < 8)
+                return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+            remaining_bits -= 8;
+            std::uint8_t residue_classbook = (std::uint8_t)ReadBits(8, read_position, bit_offset);
+
+            if (residue_classbook >= codebooks.size())
+                return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+
+            {
+                VorbisCodebook const& classbook = codebooks[residue_classbook];
+                if (std::pow((float)residue_classif_count, (float)classbook.dimensions)
+                    > (float)classbook.entry_count)
+                    return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+            }
+
+            std::cout << "Residue " << std::endl
+                      << std::dec << residue_type << " "
+                      << std::dec << residue_begin << " "
+                      << std::dec << residue_end << " "
+                      << std::dec << residue_partition_size << " "
+                      << std::dec << (unsigned)residue_classif_count << " "
+                      << std::dec << (unsigned)residue_classbook << std::endl;
+
+            std::vector<std::uint8_t> residue_cascade(residue_classif_count);
+            for (std::uint8_t classif_index = 0u;
+                 classif_index < residue_classif_count; ++classif_index)
+            {
+                if (remaining_bits < 3)
+                    return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                remaining_bits -= 3;
+                std::uint8_t low_bits = (std::uint8_t)ReadBits(3, read_position, bit_offset);
+
+                if (!remaining_bits)
+                    return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                --remaining_bits;
+                bool bitflag = !!ReadBits(1, read_position, bit_offset);
+
+                std::uint8_t high_bits = 0u;
+                if (bitflag)
+                {
+                    if (remaining_bits < 5)
+                        return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                    remaining_bits -= 5;
+                    high_bits = (std::uint8_t)ReadBits(5, read_position, bit_offset);
+                }
+
+                residue_cascade[classif_index] = (high_bits << 3) | low_bits;
+            }
+
+            std::cout << "Residue cascades " << std::endl;
+            std::for_each(residue_cascade.begin(), residue_cascade.end(), [](std::uint8_t const& _v)
+            {
+                std::cout << std::hex << (unsigned)_v << " ";
+            });
+            std::cout << std::endl;
+
+            std::vector<std::uint16_t> residue_books(residue_classif_count * 8u);
+            static constexpr std::uint16_t kUnusedResidueBook = 0x100u;
+            for (std::uint8_t classif_index = 0u;
+                 classif_index < residue_classif_count; ++classif_index)
+                for (std::uint8_t stage_index = 0u;
+                     stage_index < 8u; ++stage_index)
+                    if (residue_cascade[classif_index] & (1u << stage_index))
+                    {
+                        if (remaining_bits < 8)
+                            return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                        remaining_bits -= 8;
+                        std::uint8_t residue_book_index =
+                            (std::uint8_t)ReadBits(8, read_position, bit_offset);
+
+                        if (residue_book_index >= codebook_count)
+                            return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                        if (!codebooks[residue_book_index].entry_count)
+                            return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+
+                        residue_books[classif_index * 8u + stage_index] = residue_book_index;
+                    }
+                    else
+                        residue_books[classif_index * 8u + stage_index] = kUnusedResidueBook;
+
+            std::cout << "Residue books " << std::endl;
+            std::for_each(residue_books.begin(), residue_books.end(), [](std::uint16_t const& _v)
+            {
+                std::cout << std::dec << _v << " ";
+            });
+            std::cout << std::endl;
+        }
+
+        std::cout << "Remaining bits " << remaining_bits << std::endl;
+
+        // =====================================================================
+        // MAPPINGS
+        // =====================================================================
+
+        if (remaining_bits < 6)
+            return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+        remaining_bits -= 6;
+        std::uint8_t mapping_count = 1u + (std::uint8_t)ReadBits(6, read_position, bit_offset);
+
+        for (std::uint8_t mapping_index = 0u;
+             mapping_index < mapping_count; ++mapping_index)
+        {
+            if (remaining_bits < 16)
+                return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+            remaining_bits -= 16;
+            std::uint16_t mapping_type = (std::uint16_t)ReadBits(16, read_position, bit_offset);
+
+            if (mapping_type)
+                return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+
+            if (!remaining_bits)
+                return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+            --remaining_bits;
+            bool submap_flag = !!ReadBits(1, read_position, bit_offset);
+
+            std::uint8_t mapping_submap_count = 1u;
+            if (submap_flag)
+            {
+                if (remaining_bits < 4)
+                    return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                remaining_bits -= 4;
+                mapping_submap_count = (std::uint8_t)ReadBits(4, read_position, bit_offset);
+            }
+
+            if (!remaining_bits)
+                return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+            --remaining_bits;
+            bool coupling_flag = !!ReadBits(1, read_position, bit_offset);
+
+            std::uint8_t mapping_coupling_step_count = 0;
+            std::vector<std::uint32_t> mapping_magnitudes{};
+            std::vector<std::uint32_t> mapping_angles{};
+            if (coupling_flag)
+            {
+                if (remaining_bits < 8)
+                    return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                remaining_bits -= 8;
+                mapping_coupling_step_count = (std::uint8_t)ReadBits(8, read_position, bit_offset);
+
+                mapping_magnitudes.resize(mapping_coupling_step_count);
+                mapping_angles.resize(mapping_coupling_step_count);
+                unsigned bit_size = ilog(o_id_header.audio_channels - 1);
+
+                for (std::uint8_t step_index = 0u;
+                     step_index < mapping_coupling_step_count; ++step_index)
+                {
+                    if (remaining_bits < bit_size)
+                        return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                    remaining_bits -= 8;
+                    mapping_magnitudes[step_index] = ReadBits(bit_size, read_position, bit_offset);
+
+                    if (remaining_bits < bit_size)
+                        return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                    remaining_bits -= 8;
+                    mapping_angles[step_index] = ReadBits(bit_size, read_position, bit_offset);
+
+                    if (mapping_magnitudes[step_index] >= o_id_header.audio_channels)
+                        return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                    if (mapping_angles[step_index] >= o_id_header.audio_channels)
+                        return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                    if (mapping_magnitudes[step_index] == mapping_angles[step_index])
+                        return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+                }
+            }
+
+            if (remaining_bits < 2)
+                return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+            remaining_bits -= 2;
+            std::uint8_t reserved_field = (std::uint8_t)ReadBits(2, read_position, bit_offset);
+            std::cout << "Reserved field " << (unsigned)reserved_field << std::endl;
+            if (reserved_field)
                 return PackError(EVorbisError::kInvalidSetupHeader, 0u);
         }
 
