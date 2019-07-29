@@ -15,6 +15,7 @@
 #include <fstream>
 #include <memory>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 enum class EOggDecodeState
@@ -281,7 +282,98 @@ struct VorbisCodebook
 {
     std::uint16_t dimensions;
     std::uint32_t entry_count;
-    std::unique_ptr<std::uint8_t> entry_lengths;
+    std::vector<std::uint8_t> entry_lengths;
+
+    bool ordered;
+    bool sparse;
+
+    std::uint8_t lookup_type;
+    float min_value;
+    float delta_value;
+    std::uint8_t multiplicand_bit_size;
+    bool sequence_p;
+    std::vector<std::uint16_t> multiplicands;
+};
+
+struct VorbisFloor
+{
+    struct Floor0
+    {
+        std::uint8_t order;
+        std::uint16_t rate;
+        std::uint16_t bark_map_size;
+        std::uint8_t amplitude_bits;
+        std::uint8_t amplitude_offset;
+        std::uint8_t book_count;
+        std::vector<std::uint8_t> codebooks;
+    };
+
+    struct Floor1
+    {
+        struct Class
+        {
+            std::uint8_t dimensions;
+            std::uint8_t subclass_logcount;
+            std::uint8_t masterbook_count;
+            std::vector<std::uint8_t> subclass_codebooks;
+        };
+
+        std::uint8_t partition_count;
+        std::vector<std::uint8_t> partition_classes;
+        std::vector<Class> classes;
+        std::uint8_t multiplier;
+        std::uint32_t value_count;
+        std::vector<std::uint16_t> values;
+    };
+
+    std::uint16_t type;
+    std::variant<Floor0, Floor1> data;
+};
+
+struct VorbisResidue
+{
+    static constexpr std::uint16_t kUnusedBook = 0x100u;
+
+    std::uint16_t type;
+    std::uint32_t begin;
+    std::uint32_t end;
+    std::uint32_t partition_size;
+    std::uint8_t classif_count;
+    std::uint8_t classbook;
+    std::vector<std::uint8_t> cascade;
+    std::vector<std::uint16_t> books;
+};
+
+struct VorbisMapping
+{
+    std::uint16_t type;
+    bool submap_flag;
+    std::uint8_t submap_count;
+    bool coupling_flag;
+    std::uint8_t coupling_step_count;
+    std::vector<std::uint32_t> magnitudes;
+    std::vector<std::uint32_t> angles;
+    std::uint8_t reserved_field;
+    std::vector<std::uint8_t> muxes;
+    std::vector<std::uint8_t> submap_floors;
+    std::vector<std::uint8_t> submap_residues;
+};
+
+struct VorbisMode
+{
+    bool blockflag;
+    std::uint16_t windowtype;
+    std::uint16_t transformtype;
+    std::uint8_t mapping;
+};
+
+struct VorbisSetupHeader
+{
+    std::vector<VorbisCodebook> codebooks;
+    std::vector<VorbisFloor> floors;
+    std::vector<VorbisResidue> residues;
+    std::vector<VorbisMapping> mappings;
+    std::vector<VorbisMode> modes;
 };
 
 enum class EVorbisDecodeState
@@ -399,6 +491,41 @@ std::uint32_t ReadBits(int _count,
     return result;
 }
 
+#if 0
+// Single field, N fields
+// biased (+1, -1), unbiased
+// constant size, variable size
+
+// Single, unbiased, constant size fields
+// Single, unbiased, variable size fields
+// Single, biased, constant size fields
+// N, unbiased, constant size fields
+// N, unbiased, variable size fields
+// N, biased, constant size fields
+template <int ... kSizes, typename ... Fields>
+EVorbisError ReadFields(std::uint8_t const* &_base_address,
+                        int &_bit_offset,
+                        int &_remaining_bits,
+                        Fields& ... _fields)
+{
+    static auto const _ReadBits = [](int _count, std::uint8_t const* &_base, int &_offset,
+                                     auto &_field) {
+        _field = static_cast<std::remove_reference_t<decltype(_field)>>(ReadBits(_count, _base, _offset));
+    };
+    constexpr int kTotalSize = (0 + ... + kSizes);
+
+    if (kTotalSize <= _remaining_bits)
+    {
+        _remaining_bits -= kTotalSize;
+        (_ReadBits(kSizes, _base_address, _bit_offset, _fields), ...);
+
+        return EVorbisError::kNoError;
+    }
+    else
+        return EVorbisError::kEndOfStream;
+}
+#endif
+
 EVorbisError VorbisCodebookDecode(std::uint8_t const* &_base_address,
                                   int &_bit_offset,
                                   int &_remaining_bits,
@@ -423,21 +550,21 @@ EVorbisError VorbisCodebookDecode(std::uint8_t const* &_base_address,
         return EVorbisError::kIncompleteHeader;
     _remaining_bits -= 24;
     o_codebook.entry_count = ReadBits(24, _base_address, _bit_offset);
-    o_codebook.entry_lengths.reset(new std::uint8_t[o_codebook.entry_count]);
+    o_codebook.entry_lengths.resize(o_codebook.entry_count);
 
     if (!_remaining_bits)
         return EVorbisError::kIncompleteHeader;
     _remaining_bits -= 1;
-    bool ordered = ReadBits(1, _base_address, _bit_offset);
+    o_codebook.ordered = ReadBits(1, _base_address, _bit_offset);
 
-    if (!ordered)
+    if (!o_codebook.ordered)
     {
         if (!_remaining_bits)
             return EVorbisError::kIncompleteHeader;
         _remaining_bits -= 1;
-        bool sparse = ReadBits(1, _base_address, _bit_offset);
+        o_codebook.sparse = ReadBits(1, _base_address, _bit_offset);
 
-        if (sparse)
+        if (o_codebook.sparse)
         {
             std::cout << "sparse" << std::endl;
 
@@ -449,14 +576,14 @@ EVorbisError VorbisCodebookDecode(std::uint8_t const* &_base_address,
                 --_remaining_bits;
                 bool flag = ReadBits(1, _base_address, _bit_offset);
 
-                o_codebook.entry_lengths.get()[entry_index] = 0u;
+                o_codebook.entry_lengths[entry_index] = 0u;
                 if (flag)
                 {
                     if (_remaining_bits < 5)
                         return EVorbisError::kIncompleteHeader;
                     _remaining_bits -= 5;
-                    o_codebook.entry_lengths.get()[entry_index] =
-                        (std::uint8_t)ReadBits(5, _base_address, _bit_offset) + 1u;
+                    o_codebook.entry_lengths[entry_index] = 1u +
+                        (std::uint8_t)ReadBits(5, _base_address, _bit_offset);
                 }
             }
         }
@@ -470,8 +597,8 @@ EVorbisError VorbisCodebookDecode(std::uint8_t const* &_base_address,
             for (std::size_t entry_index = 0u;
                  entry_index < o_codebook.entry_count; ++entry_index)
             {
-                o_codebook.entry_lengths.get()[entry_index] =
-                    (std::uint8_t)ReadBits(5, _base_address, _bit_offset) + 1u;
+                o_codebook.entry_lengths[entry_index] = 1u +
+                    (std::uint8_t)ReadBits(5, _base_address, _bit_offset);
             }
         }
     }
@@ -492,8 +619,8 @@ EVorbisError VorbisCodebookDecode(std::uint8_t const* &_base_address,
             _remaining_bits -= bits_read;
             std::uint32_t const entry_range = ReadBits(bits_read, _base_address, _bit_offset);
 
-            std::fill(o_codebook.entry_lengths.get() + entry_index,
-                      o_codebook.entry_lengths.get() + entry_index + entry_range,
+            std::fill(std::next(std::begin(o_codebook.entry_lengths), entry_index),
+                      std::next(std::begin(o_codebook.entry_lengths), entry_index + entry_range),
                       current_length);
 
             entry_index += entry_range;
@@ -507,14 +634,14 @@ EVorbisError VorbisCodebookDecode(std::uint8_t const* &_base_address,
     if (_remaining_bits < 4)
         return EVorbisError::kIncompleteHeader;
     _remaining_bits -= 4;
-    std::uint8_t const lookup_type = (std::uint8_t)ReadBits(4, _base_address, _bit_offset);
+    o_codebook.lookup_type = (std::uint8_t)ReadBits(4, _base_address, _bit_offset);
 
-    std::cout << "Lookup type " << (unsigned)lookup_type << std::endl;
+    std::cout << "Lookup type " << (unsigned)o_codebook.lookup_type << std::endl;
 
-    if (lookup_type > 2u)
+    if (o_codebook.lookup_type > 2u)
         return EVorbisError::kInvalidSetupHeader;
 
-    if (lookup_type)
+    if (o_codebook.lookup_type)
     {
         // N.0 * 2^(E - 788) <=> 1.m * 2^(e - 127) * 2^X
         // 1m.0 * 2^-23 * 2^(e-127) * 2^X
@@ -555,41 +682,41 @@ EVorbisError VorbisCodebookDecode(std::uint8_t const* &_base_address,
             return EVorbisError::kIncompleteHeader;
         _remaining_bits -= 32;
         std::uint32_t binary_min_value = ReadBits(32, _base_address, _bit_offset);
-        float min_value = float32_unpack(binary_min_value);
+        o_codebook.min_value = float32_unpack(binary_min_value);
 
         if (_remaining_bits < 32)
             return EVorbisError::kIncompleteHeader;
         _remaining_bits -= 32;
         std::uint32_t binary_delta_value = ReadBits(32, _base_address, _bit_offset);
-        float delta_value = float32_unpack(binary_delta_value);
+        o_codebook.delta_value = float32_unpack(binary_delta_value);
 
-        std::cout << "Min value " << min_value << std::endl;
-        std::cout << "Delta value " << delta_value << std::endl;
+        std::cout << "Min value " << o_codebook.min_value << std::endl;
+        std::cout << "Delta value " << o_codebook.delta_value << std::endl;
 
         if (_remaining_bits < 4)
             return EVorbisError::kIncompleteHeader;
         _remaining_bits -= 4;
-        std::uint8_t value_bit_count = (std::uint8_t)ReadBits(4, _base_address, _bit_offset) + 1u;
+        o_codebook.multiplicand_bit_size = 1u + (std::uint8_t)ReadBits(4, _base_address, _bit_offset);
 
         if (!_remaining_bits)
             return EVorbisError::kIncompleteHeader;
         --_remaining_bits;
-        bool sequence_p = !!ReadBits(1, _base_address, _bit_offset);
+        o_codebook.sequence_p = ReadBits(1, _base_address, _bit_offset);
 
         std::uint32_t value_count = 0u;
-        if (lookup_type == 1u)
+        if (o_codebook.lookup_type == 1u)
             value_count = lookup1_values(o_codebook.entry_count, o_codebook.dimensions);
         else
             value_count = o_codebook.entry_count * o_codebook.dimensions;
 
-        std::vector<std::uint16_t> multiplicands;
-        multiplicands.reserve(value_count);
+        o_codebook.multiplicands.resize(value_count);
         for (std::uint32_t value_index = 0u; value_index < value_count; ++value_index)
         {
-            if (_remaining_bits < value_bit_count)
+            if (_remaining_bits < o_codebook.multiplicand_bit_size)
                 return EVorbisError::kIncompleteHeader;
-            _remaining_bits -= value_bit_count;
-            multiplicands.emplace_back((std::uint16_t)ReadBits(value_bit_count, _base_address, _bit_offset));
+            _remaining_bits -= o_codebook.multiplicand_bit_size;
+            o_codebook.multiplicands[value_index] =
+                (std::uint16_t)ReadBits(o_codebook.multiplicand_bit_size, _base_address, _bit_offset);
         }
     }
 
@@ -708,6 +835,8 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
         int bit_offset = 0;
         int remaining_bits = (packet_size - 7) * 8;
 
+        VorbisSetupHeader o_setup_header;
+
         // =====================================================================
         // CODEBOOKS
         // =====================================================================
@@ -723,7 +852,7 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
         std::size_t const codebook_count = 1u + (std::size_t)ReadBits(8, read_position, bit_offset);
 
         std::cout << std::dec << "Codebook count " << codebook_count << std::endl;
-        std::vector<VorbisCodebook> codebooks(codebook_count);
+        o_setup_header.codebooks.resize(codebook_count);
         for (std::size_t codebook_index = 0u;
              error_code == EVorbisError::kNoError && codebook_index < codebook_count;
              ++codebook_index)
@@ -731,25 +860,40 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
             error_code = VorbisCodebookDecode(read_position,
                                               bit_offset,
                                               remaining_bits,
-                                              codebooks[codebook_index]);
+                                              o_setup_header.codebooks[codebook_index]);
 
-            VorbisCodebook const& codebook = codebooks[codebook_index];
+            VorbisCodebook const& codebook = o_setup_header.codebooks[codebook_index];
 
 #if 1
             std::cout << "Codebook " << std::dec << codebook_index << std::endl
                       << std::dec << codebook.dimensions << " "
                       << std::dec << codebook.entry_count << std::endl;
-            if (codebook.entry_lengths)
-                for (std::uint32_t entry_index = 0u;
-                     entry_index < codebook.entry_count; ++entry_index)
-                    std::cout << std::dec
-                              << (unsigned)codebook.entry_lengths.get()[entry_index] << " ";
+            for (std::uint32_t entry_index = 0u;
+                 entry_index < codebook.entry_count; ++entry_index)
+                std::cout << std::dec
+                          << (unsigned)codebook.entry_lengths[entry_index] << " ";
             std::cout << std::endl;
 #endif
         }
 
         if (error_code != EVorbisError::kNoError)
             return PackError(error_code, 0u);
+
+        if (remaining_bits < 6)
+            return PackError(EVorbisError::kIncompleteHeader, 0u);
+        remaining_bits -= 6;
+        std::uint8_t vorbis_time_count = 1u + (std::uint8_t)ReadBits(6, read_position, bit_offset);
+
+        for (std::uint8_t vorbis_time_index = 0u;
+             vorbis_time_index < vorbis_time_count; ++vorbis_time_index)
+        {
+            if (remaining_bits < 16)
+                return PackError(EVorbisError::kIncompleteHeader, 0u);
+            remaining_bits -= 16;
+            std::uint16_t v = (std::uint16_t)ReadBits(16, read_position, bit_offset);
+            if (v)
+                return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+        }
 
         // =====================================================================
         // FLOORS
@@ -763,130 +907,129 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
         if (remaining_bits < 6)
             return PackError(EVorbisError::kIncompleteHeader, 0u);
         remaining_bits -= 6;
-        std::uint8_t vorbis_time_count = (std::uint8_t)ReadBits(6, read_position, bit_offset) + 1u;
-        for (std::uint8_t vorbis_time_index = 0u;
-             vorbis_time_index < vorbis_time_count; ++vorbis_time_index)
-        {
-            if (remaining_bits < 16)
-                return PackError(EVorbisError::kIncompleteHeader, 0u);
-            remaining_bits -= 16;
-            std::uint16_t v = (std::uint16_t)ReadBits(16, read_position, bit_offset);
-            if (v)
-                return PackError(EVorbisError::kInvalidSetupHeader, 0u);
-        }
-
-        if (remaining_bits < 6)
-            return PackError(EVorbisError::kIncompleteHeader, 0u);
-        remaining_bits -= 6;
         std::uint8_t vorbis_floor_count = (std::uint8_t)ReadBits(6, read_position, bit_offset) + 1u;
+
         std::cout << std::dec << "floor count " << (unsigned)vorbis_floor_count << std::endl;
+        o_setup_header.floors.resize(vorbis_floor_count);
+
         for (std::uint8_t floor_index = 0u;
              floor_index < vorbis_floor_count; ++floor_index)
         {
+            VorbisFloor &floor = o_setup_header.floors[floor_index];
+
             if (remaining_bits < 16)
                 return PackError(EVorbisError::kIncompleteHeader, 0u);
             remaining_bits -= 16;
-            std::uint16_t vorbis_floor_type = (std::uint16_t)ReadBits(16, read_position, bit_offset);
-            std::cout << std::dec << "floor type " << (unsigned)vorbis_floor_type << std::endl;
+            floor.type = (std::uint16_t)ReadBits(16, read_position, bit_offset);
+            std::cout << std::dec << "floor type " << (unsigned)floor.type << std::endl;
 
-            if (vorbis_floor_type == 0u)
+            if (floor.type == 0u)
             {
+                floor.data = VorbisFloor::Floor0{};
+                VorbisFloor::Floor0 &floor0 = std::get<0>(floor.data);
+
                 std::cout << "[WARNING] floor0 detected, anything may happen" << std::endl;
 
                 if (remaining_bits < 8)
                     return PackError(EVorbisError::kIncompleteHeader, 0u);
                 remaining_bits -= 8;
-                std::uint8_t floor0_order = (std::uint8_t)ReadBits(8, read_position, bit_offset);
+                floor0.order = (std::uint8_t)ReadBits(8, read_position, bit_offset);
 
                 if (remaining_bits < 16)
                     return PackError(EVorbisError::kIncompleteHeader, 0u);
                 remaining_bits -= 16;
-                std::uint16_t floor0_rate = (std::uint16_t)ReadBits(16, read_position, bit_offset);
+                floor0.rate = (std::uint16_t)ReadBits(16, read_position, bit_offset);
 
                 if (remaining_bits < 16)
                     return PackError(EVorbisError::kIncompleteHeader, 0u);
                 remaining_bits -= 16;
-                std::uint16_t floor0_bark_map_size = (std::uint16_t)ReadBits(16, read_position, bit_offset);
+                floor0.bark_map_size = (std::uint16_t)ReadBits(16, read_position, bit_offset);
 
                 if (remaining_bits < 6)
                     return PackError(EVorbisError::kIncompleteHeader, 0u);
                 remaining_bits -= 6;
-                std::uint8_t floor0_amplitude_bits = (std::uint8_t)ReadBits(6, read_position, bit_offset);
+                floor0.amplitude_bits = (std::uint8_t)ReadBits(6, read_position, bit_offset);
 
                 if (remaining_bits < 8)
                     return PackError(EVorbisError::kIncompleteHeader, 0u);
                 remaining_bits -= 8;
-                std::uint8_t floor0_amplitude_offset = (std::uint8_t)ReadBits(8, read_position, bit_offset);
+                floor0.amplitude_offset = (std::uint8_t)ReadBits(8, read_position, bit_offset);
 
                 if (remaining_bits < 4)
                     return PackError(EVorbisError::kIncompleteHeader, 0u);
                 remaining_bits -= 4;
-                std::uint8_t floor0_book_count = (std::uint8_t)ReadBits(4, read_position, bit_offset) + 1u;
+                floor0.book_count = 1u + (std::uint8_t)ReadBits(4, read_position, bit_offset);
 
+                floor0.codebooks.resize(floor0.book_count);
                 for (std::uint8_t book_index = 0u;
-                     book_index < floor0_book_count; ++book_index)
+                     book_index < floor0.book_count; ++book_index)
                 {
                     if (remaining_bits < 8)
                         return PackError(EVorbisError::kIncompleteHeader, 0u);
                     remaining_bits -= 8;
-                    std::uint8_t codebook_index = (std::uint8_t)ReadBits(8, read_position, bit_offset);
-                    std::cout << std::dec << "codebook index " << (unsigned)codebook_index << std::endl;
+                    floor0.codebooks[book_index] = (std::uint8_t)ReadBits(8, read_position, bit_offset);
                 }
             }
 
-            else if (vorbis_floor_type == 1u)
+            else if (floor.type == 1u)
             {
+                floor.data = VorbisFloor::Floor1{};
+                VorbisFloor::Floor1 &floor1 = std::get<1>(floor.data);
+
                 if (remaining_bits < 5)
                     return PackError(EVorbisError::kIncompleteHeader, 0u);
                 remaining_bits -= 5;
-                std::uint8_t floor1_partition_count = (std::uint8_t)ReadBits(5, read_position, bit_offset);
+                floor1.partition_count = (std::uint8_t)ReadBits(5, read_position, bit_offset);
 
                 int maximum_class = -1;
-                std::vector<std::uint8_t> floor1_partition_classes(floor1_partition_count);
+                floor1.partition_classes.resize(floor1.partition_count);
                 for (std::uint8_t partition_index = 0u;
-                     partition_index < floor1_partition_count;
+                     partition_index < floor1.partition_count;
                      ++partition_index)
                 {
                     if (remaining_bits < 4)
                         return PackError(EVorbisError::kIncompleteHeader, 0u);
                     remaining_bits -= 4;
-                    floor1_partition_classes[partition_index] = (std::uint8_t)ReadBits(4, read_position, bit_offset);
-                    maximum_class = std::max(maximum_class, (int)floor1_partition_classes[partition_index]);
+                    std::uint8_t partition_class = (std::uint8_t)ReadBits(4, read_position, bit_offset);
+
+                    floor1.partition_classes[partition_index] = partition_class;
+                    maximum_class = std::max(maximum_class, (int)partition_class);
                 }
 
-                std::vector<std::uint8_t> floor1_class_dimensions(maximum_class + 1);
+                floor1.classes.resize(maximum_class + 1);
                 for (int class_index = 0;
                      class_index <= maximum_class; ++class_index)
                 {
+                    VorbisFloor::Floor1::Class &floor_class = floor1.classes[class_index];
+
                     if (remaining_bits < 3)
                         return PackError(EVorbisError::kIncompleteHeader, 0u);
                     remaining_bits -= 3;
-                    floor1_class_dimensions[class_index] = (std::uint8_t)ReadBits(3, read_position, bit_offset) + 1u;
+                    floor_class.dimensions = 1u + (std::uint8_t)ReadBits(3, read_position, bit_offset);
 
                     if (remaining_bits < 2)
                         return PackError(EVorbisError::kIncompleteHeader, 0u);
                     remaining_bits -= 2;
-                    std::uint8_t floor1_class_subclass_logcount =
-                        (std::uint8_t)ReadBits(2, read_position, bit_offset);
+                    floor_class.subclass_logcount = (std::uint8_t)ReadBits(2, read_position, bit_offset);
 
-                    std::uint8_t floor1_class_masterbook_count = 0u;
-                    if (floor1_class_subclass_logcount)
+                    floor_class.masterbook_count = 0u;
+                    if (floor_class.subclass_logcount)
                     {
                         if (remaining_bits < 8)
                             return PackError(EVorbisError::kIncompleteHeader, 0u);
                         remaining_bits -= 8;
-                        floor1_class_masterbook_count = (std::uint8_t)ReadBits(8, read_position, bit_offset);
+                        floor_class.masterbook_count = (std::uint8_t)ReadBits(8, read_position, bit_offset);
                     }
 
-                    std::vector<std::uint8_t> floor1_subclass_books((1u << floor1_class_subclass_logcount));
+                    floor_class.subclass_codebooks.resize(1u << floor_class.subclass_logcount);
                     for (std::size_t subclass_index = 0u;
-                         subclass_index < floor1_subclass_books.size();
+                         subclass_index < floor_class.subclass_codebooks.size();
                          ++subclass_index)
                     {
                         if (remaining_bits < 8)
                             return PackError(EVorbisError::kIncompleteHeader, 0u);
                         remaining_bits -= 8;
-                        floor1_subclass_books[subclass_index] =
+                        floor_class.subclass_codebooks[subclass_index] =
                             (std::uint8_t)ReadBits(8, read_position, bit_offset) - 1u;
                     }
                 }
@@ -894,33 +1037,33 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
                 if (remaining_bits < 2)
                     return PackError(EVorbisError::kIncompleteHeader, 0u);
                 remaining_bits -= 2;
-                std::uint8_t floor1_multiplier = (std::uint8_t)ReadBits(2, read_position, bit_offset) + 1u;
+                floor1.multiplier = 1u + (std::uint8_t)ReadBits(2, read_position, bit_offset);
 
                 if (remaining_bits < 4)
                     return PackError(EVorbisError::kIncompleteHeader, 0u);
                 remaining_bits -= 4;
                 std::uint8_t range_bits = (std::uint8_t)ReadBits(4, read_position, bit_offset);
 
-                unsigned floor1_value_count = 2u;
+                floor1.value_count = 2u;
                 for (std::size_t partition_index = 0u;
-                     partition_index < floor1_partition_classes.size();
+                     partition_index < floor1.partition_count;
                      ++partition_index)
                 {
-                    std::uint8_t class_index = floor1_partition_classes[partition_index];
-                    std::uint8_t dimension_count = floor1_class_dimensions[class_index];
-                    floor1_value_count += dimension_count;
+                    std::uint8_t class_index = floor1.partition_classes[partition_index];
+                    std::uint8_t dimension_count = floor1.classes[class_index].dimensions;
+                    floor1.value_count += dimension_count;
                 }
 
-                std::vector<std::uint16_t> floor1_Xs(floor1_value_count);
-                floor1_Xs[0] = 0u;
-                floor1_Xs[1] = (1u << range_bits);
+                floor1.values.resize(floor1.value_count);
+                floor1.values[0] = 0u;
+                floor1.values[1] = (1u << range_bits);
                 std::size_t floor1_value_index = 2u;
                 for (std::size_t partition_index = 0u;
-                     partition_index < floor1_partition_count;
+                     partition_index < floor1.partition_count;
                      ++partition_index)
                 {
-                    std::uint8_t class_index = floor1_partition_classes[partition_index];
-                    std::uint8_t dimension_count = floor1_class_dimensions[class_index];
+                    std::uint8_t class_index = floor1.partition_classes[partition_index];
+                    std::uint8_t dimension_count = floor1.classes[class_index].dimensions;
 
                     for (std::uint8_t dimension_index = 0u;
                          dimension_index < dimension_count;
@@ -929,7 +1072,7 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
                         if (remaining_bits < range_bits)
                             return PackError(EVorbisError::kIncompleteHeader, 0u);
                         remaining_bits -= range_bits;
-                        floor1_Xs[floor1_value_index++] =
+                        floor1.values[floor1_value_index++] =
                             (std::uint16_t)ReadBits(range_bits, read_position, bit_offset);
                     }
                 }
@@ -954,64 +1097,67 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
         std::uint8_t residue_count = 1u + (std::uint8_t)ReadBits(6, read_position, bit_offset);
 
         std::cout << "Residue count " << std::dec << (unsigned)residue_count << std::endl;
+        o_setup_header.residues.resize(residue_count);
 
         for (std::uint8_t residue_index = 0u;
              residue_index < residue_count; ++residue_index)
         {
+            VorbisResidue &residue = o_setup_header.residues[residue_index];
+
             if (remaining_bits < 16)
                 return PackError(EVorbisError::kIncompleteHeader, 0u);
             remaining_bits -= 16;
-            std::uint16_t residue_type = (std::uint16_t)ReadBits(16, read_position, bit_offset);
+            residue.type = (std::uint16_t)ReadBits(16, read_position, bit_offset);
 
-            if (residue_type > 2)
+            if (residue.type > 2)
                 return PackError(EVorbisError::kInvalidSetupHeader, 0u);
 
             if (remaining_bits < 24)
                 return PackError(EVorbisError::kIncompleteHeader, 0u);
             remaining_bits -= 24;
-            std::uint32_t residue_begin = ReadBits(24, read_position, bit_offset);
+            residue.begin = ReadBits(24, read_position, bit_offset);
 
             if (remaining_bits < 24)
                 return PackError(EVorbisError::kIncompleteHeader, 0u);
             remaining_bits -= 24;
-            std::uint32_t residue_end = ReadBits(24, read_position, bit_offset);
+            residue.end = ReadBits(24, read_position, bit_offset);
 
             if (remaining_bits < 24)
                 return PackError(EVorbisError::kIncompleteHeader, 0u);
             remaining_bits -= 24;
-            std::uint32_t residue_partition_size = 1u + ReadBits(24, read_position, bit_offset);
+            residue.partition_size = 1u + ReadBits(24, read_position, bit_offset);
 
             if (remaining_bits < 6)
                 return PackError(EVorbisError::kIncompleteHeader, 0u);
             remaining_bits -= 6;
-            std::uint8_t residue_classif_count = 1u + (std::uint8_t)ReadBits(6, read_position, bit_offset);
+            residue.classif_count = 1u + (std::uint8_t)ReadBits(6, read_position, bit_offset);
 
             if (remaining_bits < 8)
                 return PackError(EVorbisError::kIncompleteHeader, 0u);
             remaining_bits -= 8;
-            std::uint8_t residue_classbook = (std::uint8_t)ReadBits(8, read_position, bit_offset);
+            residue.classbook = (std::uint8_t)ReadBits(8, read_position, bit_offset);
 
-            if (residue_classbook >= codebooks.size())
+            if (residue.classbook >= o_setup_header.codebooks.size())
                 return PackError(EVorbisError::kInvalidSetupHeader, 0u);
 
             {
-                VorbisCodebook const& classbook = codebooks[residue_classbook];
-                if (std::pow((float)residue_classif_count, (float)classbook.dimensions)
+                VorbisCodebook const& classbook = o_setup_header.codebooks[residue.classbook];
+                if (std::pow((float)residue.classif_count, (float)classbook.dimensions)
                     > (float)classbook.entry_count)
                     return PackError(EVorbisError::kInvalidSetupHeader, 0u);
             }
 
             std::cout << "Residue " << std::endl
-                      << std::dec << residue_type << " "
-                      << std::dec << residue_begin << " "
-                      << std::dec << residue_end << " "
-                      << std::dec << residue_partition_size << " "
-                      << std::dec << (unsigned)residue_classif_count << " "
-                      << std::dec << (unsigned)residue_classbook << std::endl;
+                      << std::dec << residue.type << " "
+                      << std::dec << residue.begin << " "
+                      << std::dec << residue.end << " "
+                      << std::dec << residue.partition_size << " "
+                      << std::dec << (unsigned)residue.classif_count << " "
+                      << std::dec << (unsigned)residue.classbook << std::endl;
 
-            std::vector<std::uint8_t> residue_cascade(residue_classif_count);
+            residue.cascade.resize(residue.classif_count);
             for (std::uint8_t classif_index = 0u;
-                 classif_index < residue_classif_count; ++classif_index)
+                 classif_index < residue.classif_count; ++classif_index)
             {
                 if (remaining_bits < 3)
                     return PackError(EVorbisError::kIncompleteHeader, 0u);
@@ -1021,7 +1167,7 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
                 if (!remaining_bits)
                     return PackError(EVorbisError::kIncompleteHeader, 0u);
                 --remaining_bits;
-                bool bitflag = !!ReadBits(1, read_position, bit_offset);
+                bool bitflag = ReadBits(1, read_position, bit_offset);
 
                 std::uint8_t high_bits = 0u;
                 if (bitflag)
@@ -1032,42 +1178,40 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
                     high_bits = (std::uint8_t)ReadBits(5, read_position, bit_offset);
                 }
 
-                residue_cascade[classif_index] = (high_bits << 3) | low_bits;
+                residue.cascade[classif_index] = (high_bits << 3) | low_bits;
             }
 
             std::cout << "Residue cascades " << std::endl;
-            std::for_each(residue_cascade.begin(), residue_cascade.end(), [](std::uint8_t const& _v)
+            std::for_each(residue.cascade.begin(), residue.cascade.end(), [](std::uint8_t const& _v)
             {
                 std::cout << std::hex << (unsigned)_v << " ";
             });
             std::cout << std::endl;
 
-            std::vector<std::uint16_t> residue_books(residue_classif_count * 8u);
-            static constexpr std::uint16_t kUnusedResidueBook = 0x100u;
+            residue.books.resize(residue.classif_count * 8u);
             for (std::uint8_t classif_index = 0u;
-                 classif_index < residue_classif_count; ++classif_index)
+                 classif_index < residue.classif_count; ++classif_index)
                 for (std::uint8_t stage_index = 0u;
                      stage_index < 8u; ++stage_index)
-                    if (residue_cascade[classif_index] & (1u << stage_index))
+                    if (residue.cascade[classif_index] & (1u << stage_index))
                     {
                         if (remaining_bits < 8)
                             return PackError(EVorbisError::kIncompleteHeader, 0u);
                         remaining_bits -= 8;
-                        std::uint8_t residue_book_index =
-                            (std::uint8_t)ReadBits(8, read_position, bit_offset);
+                        std::uint8_t residue_book_index = (std::uint8_t)ReadBits(8, read_position, bit_offset);
 
                         if (residue_book_index >= codebook_count)
                             return PackError(EVorbisError::kInvalidSetupHeader, 0u);
-                        if (!codebooks[residue_book_index].entry_count)
+                        if (!o_setup_header.codebooks[residue_book_index].entry_count)
                             return PackError(EVorbisError::kInvalidSetupHeader, 0u);
 
-                        residue_books[classif_index * 8u + stage_index] = residue_book_index;
+                        residue.books[classif_index * 8u + stage_index] = residue_book_index;
                     }
                     else
-                        residue_books[classif_index * 8u + stage_index] = kUnusedResidueBook;
+                        residue.books[classif_index * 8u + stage_index] = VorbisResidue::kUnusedBook;
 
             std::cout << "Residue books " << std::endl;
-            std::for_each(residue_books.begin(), residue_books.end(), [](std::uint16_t const& _v)
+            std::for_each(residue.books.begin(), residue.books.end(), [](std::uint16_t const& _v)
             {
                 std::cout << std::dec << _v << " ";
             });
@@ -1088,70 +1232,72 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
         remaining_bits -= 6;
         std::uint8_t mapping_count = 1u + (std::uint8_t)ReadBits(6, read_position, bit_offset);
 
+        o_setup_header.mappings.resize(mapping_count);
+
         for (std::uint8_t mapping_index = 0u;
              mapping_index < mapping_count; ++mapping_index)
         {
+            VorbisMapping &mapping = o_setup_header.mappings[mapping_index];
+
             if (remaining_bits < 16)
                 return PackError(EVorbisError::kIncompleteHeader, 0u);
             remaining_bits -= 16;
-            std::uint16_t mapping_type = (std::uint16_t)ReadBits(16, read_position, bit_offset);
+            mapping.type = (std::uint16_t)ReadBits(16, read_position, bit_offset);
 
-            if (mapping_type)
+            if (mapping.type)
                 return PackError(EVorbisError::kInvalidSetupHeader, 0u);
 
             if (!remaining_bits)
                 return PackError(EVorbisError::kIncompleteHeader, 0u);
             --remaining_bits;
-            bool submap_flag = !!ReadBits(1, read_position, bit_offset);
+            mapping.submap_flag = ReadBits(1, read_position, bit_offset);
 
-            std::uint8_t mapping_submap_count = 1u;
-            if (submap_flag)
+            mapping.submap_count = 1u;
+            if (mapping.submap_flag)
             {
                 if (remaining_bits < 4)
                     return PackError(EVorbisError::kIncompleteHeader, 0u);
                 remaining_bits -= 4;
-                mapping_submap_count = 1u + (std::uint8_t)ReadBits(4, read_position, bit_offset);
+                mapping.submap_count = 1u + (std::uint8_t)ReadBits(4, read_position, bit_offset);
             }
 
             if (!remaining_bits)
                 return PackError(EVorbisError::kIncompleteHeader, 0u);
             --remaining_bits;
-            bool coupling_flag = !!ReadBits(1, read_position, bit_offset);
+            mapping.coupling_flag = ReadBits(1, read_position, bit_offset);
 
-            std::uint8_t mapping_coupling_step_count = 0;
-            std::vector<std::uint32_t> mapping_magnitudes{};
-            std::vector<std::uint32_t> mapping_angles{};
-            if (coupling_flag)
+            mapping.coupling_step_count = 0u;
+            if (mapping.coupling_flag)
             {
                 std::cout << "coupled" << std::endl;
 
                 if (remaining_bits < 8)
                     return PackError(EVorbisError::kIncompleteHeader, 0u);
                 remaining_bits -= 8;
-                mapping_coupling_step_count = 1u + (std::uint8_t)ReadBits(8, read_position, bit_offset);
+                mapping.coupling_step_count = 1u + (std::uint8_t)ReadBits(8, read_position, bit_offset);
 
-                mapping_magnitudes.resize(mapping_coupling_step_count);
-                mapping_angles.resize(mapping_coupling_step_count);
+                mapping.magnitudes.resize(mapping.coupling_step_count);
+                mapping.angles.resize(mapping.coupling_step_count);
                 unsigned bit_size = ilog(o_id_header.audio_channels - 1);
 
                 for (std::uint8_t step_index = 0u;
-                     step_index < mapping_coupling_step_count; ++step_index)
+                     step_index < mapping.coupling_step_count; ++step_index)
                 {
                     if (remaining_bits < bit_size)
                         return PackError(EVorbisError::kIncompleteHeader, 0u);
                     remaining_bits -= bit_size;
-                    mapping_magnitudes[step_index] = ReadBits(bit_size, read_position, bit_offset);
+                    mapping.magnitudes[step_index] = ReadBits(bit_size, read_position, bit_offset);
 
                     if (remaining_bits < bit_size)
                         return PackError(EVorbisError::kIncompleteHeader, 0u);
                     remaining_bits -= bit_size;
-                    mapping_angles[step_index] = ReadBits(bit_size, read_position, bit_offset);
+                    mapping.angles[step_index] = ReadBits(bit_size, read_position, bit_offset);
 
-                    if (mapping_magnitudes[step_index] >= o_id_header.audio_channels)
+                    if (mapping.magnitudes[step_index] >= o_id_header.audio_channels)
                         return PackError(EVorbisError::kInvalidSetupHeader, 0u);
-                    if (mapping_angles[step_index] >= o_id_header.audio_channels)
+                    if (mapping.angles[step_index] >= o_id_header.audio_channels)
                         return PackError(EVorbisError::kInvalidSetupHeader, 0u);
-                    if (mapping_magnitudes[step_index] == mapping_angles[step_index])
+                    if (mapping.magnitudes[step_index] == mapping.angles[step_index])
                         return PackError(EVorbisError::kInvalidSetupHeader, 0u);
                 }
             }
@@ -1159,16 +1305,15 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
             if (remaining_bits < 2)
                 return PackError(EVorbisError::kIncompleteHeader, 0u);
             remaining_bits -= 2;
-            std::uint8_t reserved_field = (std::uint8_t)ReadBits(2, read_position, bit_offset);
-            if (reserved_field)
+            mapping.reserved_field = (std::uint8_t)ReadBits(2, read_position, bit_offset);
+            if (mapping.reserved_field)
                 return PackError(EVorbisError::kInvalidSetupHeader, 0u);
 
-            std::cout << "Mapping submap count " << (unsigned)mapping_submap_count << std::endl;
+            std::cout << "Mapping submap count " << (unsigned)mapping.submap_count << std::endl;
 
-            std::vector<std::uint8_t> mapping_muxes{};
-            if (mapping_submap_count > 1)
+            if (mapping.submap_count > 1)
             {
-                mapping_muxes.resize(o_id_header.audio_channels);
+                mapping.muxes.resize(o_id_header.audio_channels);
                 for (std::uint32_t channel_index = 0u;
                      channel_index < o_id_header.audio_channels; ++channel_index)
                 {
@@ -1177,17 +1322,17 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
                     remaining_bits -= 4;
                     std::uint8_t mapping_mux = (std::uint8_t)ReadBits(4, read_position, bit_offset);
 
-                    if (mapping_mux >= mapping_submap_count)
+                    if (mapping_mux >= mapping.submap_count)
                         return PackError(EVorbisError::kInvalidSetupHeader, 0u);
 
-                    mapping_muxes[channel_index] = mapping_mux;
+                    mapping.muxes[channel_index] = mapping_mux;
                 }
             }
 
-            std::vector<std::uint8_t> mapping_submap_floors(mapping_submap_count);
-            std::vector<std::uint8_t> mapping_submap_residues(mapping_submap_count);
+            mapping.submap_floors.resize(mapping.submap_count);
+            mapping.submap_residues.resize(mapping.submap_count);
             for (std::uint8_t submap_index = 0u;
-                 submap_index < mapping_submap_count; ++submap_index)
+                 submap_index < mapping.submap_count; ++submap_index)
             {
                 if (remaining_bits < 8)
                     return PackError(EVorbisError::kIncompleteHeader, 0u);
@@ -1203,7 +1348,7 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
                 if (floor_index >= vorbis_floor_count)
                     return PackError(EVorbisError::kInvalidSetupHeader, 0u);
 
-                mapping_submap_floors[submap_index] = floor_index;
+                mapping.submap_floors[submap_index] = floor_index;
 
                 if (remaining_bits < 8)
                     return PackError(EVorbisError::kIncompleteHeader, 0u);
@@ -1214,11 +1359,11 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
                 if (residue_index >= residue_count)
                     return PackError(EVorbisError::kInvalidSetupHeader, 0u);
 
-                mapping_submap_residues[submap_index] = residue_index;
+                mapping.submap_residues[submap_index] = residue_index;
             }
 
             std::cout << "Mapping submap floors " << std::endl;
-            std::for_each(mapping_submap_floors.begin(), mapping_submap_floors.end(), [](std::uint16_t const& _v)
+            std::for_each(mapping.submap_floors.begin(), mapping.submap_floors.end(), [](std::uint16_t const& _v)
             {
                 std::cout << std::dec << _v << " ";
             });
@@ -1226,7 +1371,7 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
 
 
             std::cout << "Mapping submap residues " << std::endl;
-            std::for_each(mapping_submap_residues.begin(), mapping_submap_residues.end(), [](std::uint16_t const& _v)
+            std::for_each(mapping.submap_residues.begin(), mapping.submap_residues.end(), [](std::uint16_t const& _v)
             {
                 std::cout << std::dec << _v << " ";
             });
@@ -1248,37 +1393,40 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
         std::uint8_t mode_count = 1u + (std::uint8_t)ReadBits(6, read_position, bit_offset);
 
         std::cout << "Mode count " << (unsigned)mode_count << std::endl;
+        o_setup_header.modes.resize(mode_count);
 
         for (std::uint8_t mode_index = 0u;
              mode_index < mode_count; ++mode_index)
         {
+            VorbisMode &mode = o_setup_header.modes[mode_index];
+
             if (!remaining_bits)
                 return PackError(EVorbisError::kIncompleteHeader, 0u);
             --remaining_bits;
-            bool mode_blockflag = !!ReadBits(1, read_position, bit_offset);
+            mode.blockflag = ReadBits(1, read_position, bit_offset);
 
             if (remaining_bits < 16)
                 return PackError(EVorbisError::kIncompleteHeader, 0u);
             remaining_bits -= 16;
-            std::uint16_t mode_windowtype = (std::uint16_t)ReadBits(16, read_position, bit_offset);
+            mode.windowtype = (std::uint16_t)ReadBits(16, read_position, bit_offset);
 
-            if (mode_windowtype)
+            if (mode.windowtype)
                 return PackError(EVorbisError::kInvalidSetupHeader, 0u);
 
             if (remaining_bits < 16)
                 return PackError(EVorbisError::kIncompleteHeader, 0u);
             remaining_bits -= 16;
-            std::uint16_t mode_transformtype = (std::uint16_t)ReadBits(16, read_position, bit_offset);
+            mode.transformtype = (std::uint16_t)ReadBits(16, read_position, bit_offset);
 
-            if (mode_transformtype)
+            if (mode.transformtype)
                 return PackError(EVorbisError::kInvalidSetupHeader, 0u);
 
             if (remaining_bits < 8)
                 return PackError(EVorbisError::kIncompleteHeader, 0u);
             remaining_bits -= 8;
-            std::uint8_t mode_mapping = (std::uint8_t)ReadBits(8, read_position, bit_offset);
+            mode.mapping = (std::uint8_t)ReadBits(8, read_position, bit_offset);
 
-            if (mode_mapping >= mapping_count)
+            if (mode.mapping >= mapping_count)
                 return PackError(EVorbisError::kInvalidSetupHeader, 0u);
         }
 
