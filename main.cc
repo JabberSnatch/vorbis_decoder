@@ -60,6 +60,15 @@ using OggContents = std::unordered_map<std::uint32_t, PageContainer>;
 int debug_PageCount = 0;
 std::uint8_t* debug_baseBuff;
 
+std::ptrdiff_t debug_ComputeOffset(PageDesc const& _page, std::size_t _seg_index)
+{
+    std::uint32_t byte_offset = 0u;
+    for (int i = 0; i < (int)_seg_index-1; ++i)
+        byte_offset += _page.segment_table[i];
+
+    return (_page.stream_begin + byte_offset) - debug_baseBuff;
+}
+
 constexpr unsigned ilog(std::uint32_t _v)
 {
     unsigned res = 0u;
@@ -82,6 +91,33 @@ constexpr std::uint32_t lookup1_values(std::uint32_t _entry_count, std::uint16_t
     while (std::pow(f_result, f_dimensions) <= f_entry_count)
         f_result += 1.f; // NOTE: _entry_count should be 24 bits
     return static_cast<std::uint32_t>(f_result) - 1u;
+}
+
+float WindowEval(std::uint32_t _n,
+                 std::uint32_t _lws, std::uint32_t _lwe,
+                 std::uint32_t _rws, std::uint32_t _rwe)
+{
+    constexpr float piOver2 = 3.1415926536f * .5f;
+
+    if (_n >= _rwe)
+        return 0.f;
+
+    if (_n >= _rws)
+    {
+        float t0 = std::sin(((float)(_n - _rws) + .5f) / (float)(_rwe-_rws) * piOver2 + piOver2);
+        return std::sin(piOver2 * t0*t0);
+    }
+
+    if (_n >= _lwe)
+        return 1.f;
+
+    if (_n >= _lws)
+    {
+        float t0 = std::sin(((float)(_n - _lws) + .5f) / (float)(_lwe-_lws) * piOver2);
+        return std::sin(piOver2 * t0*t0);
+    }
+
+    return 0.f;
 }
 
 OggContents DecodeOgg(std::uint8_t const* _buff, std::size_t _size)
@@ -237,46 +273,32 @@ std::vector<std::uint32_t> GetVorbisSerials(OggContents const& _ogg_contents)
     return result;
 }
 
-void PrintPages(PageContainer const &_pages)
+void PrintPage(PageDesc const& _desc)
 {
-    std::for_each(std::cbegin(_pages), std::cend(_pages), [](PageDesc const& _desc) {
-        if (_desc.header_type & PageDesc::FHeaderType::kFirstPage)
-            for (unsigned seg_index = 0; seg_index < _desc.segment_count; ++seg_index)
-            {
-                for (unsigned byte_index = 0; byte_index < _desc.segment_table[seg_index]; ++byte_index)
-                    std::cout << _desc.stream_begin[byte_index] << " ";
-                std::cout << std::endl << std::endl;
-            }
+    if (_desc.header_type & PageDesc::FHeaderType::kFirstPage)
+        for (unsigned seg_index = 0; seg_index < _desc.segment_count; ++seg_index)
+        {
+            for (unsigned byte_index = 0; byte_index < _desc.segment_table[seg_index]; ++byte_index)
+                std::cout << _desc.stream_begin[byte_index] << " ";
+            std::cout << std::endl << std::endl;
+        }
 
-        std::cout << "PAGE DESC" << std::endl;
-        std::cout << std::dec << (uint32_t)_desc.header_type << " "
-                  << std::dec << _desc.granule_position << " "
-                  << std::hex << _desc.stream_serial_num << " "
-                  << std::dec << _desc.page_sequence_num << " "
-                  << std::hex << _desc.page_checksum << " "
-                  << std::dec << (uint32_t)_desc.segment_count << " " << std::endl;;
-        for (unsigned i = 0; i < _desc.segment_count; ++i)
-            std::cout << std::dec << (uint32_t)_desc.segment_table[i] << " ";
-        std::cout << std::endl << std::endl;
-    });
+    std::cout << "PAGE DESC" << std::endl;
+    std::cout << std::dec << (uint32_t)_desc.header_type << " "
+              << std::dec << _desc.granule_position << " "
+              << std::hex << _desc.stream_serial_num << " "
+              << std::dec << _desc.page_sequence_num << " "
+              << std::hex << _desc.page_checksum << " "
+              << std::dec << (uint32_t)_desc.segment_count << " " << std::endl;;
+    for (unsigned i = 0; i < _desc.segment_count; ++i)
+        std::cout << std::dec << (uint32_t)_desc.segment_table[i] << " ";
+    std::cout << std::endl << std::endl;
 }
 
-struct VorbisIDHeader
+void PrintPages(PageContainer const &_pages)
 {
-    std::size_t page_index;
-    std::size_t segment_index;
-
-    static constexpr std::streamsize kSizeOnStream = 23u;
-    // std::uint32_t vorbis_version; Should be '0' to be compatible
-    std::uint8_t audio_channels;
-    std::uint32_t audio_sample_rate;
-    std::int32_t bitrate_max;
-    std::int32_t bitrate_nominal;
-    std::int32_t bitrate_min;
-    std::uint8_t blocksize_0; // read 4 bits, 2 exponent
-    std::uint8_t blocksize_1; // read 4 bits, 2 exponent
-    // + 1 bit framing flag (0x01 because of byte alignment)
-};
+    std::for_each(std::cbegin(_pages), std::cend(_pages), PrintPage);
+}
 
 struct VorbisCodebook
 {
@@ -367,21 +389,33 @@ struct VorbisMode
     std::uint8_t mapping;
 };
 
+struct VorbisIDHeader
+{
+    std::size_t page_index;
+    std::size_t segment_index;
+
+    static constexpr std::streamsize kSizeOnStream = 23u;
+    // std::uint32_t vorbis_version; Should be '0' to be compatible
+    std::uint8_t audio_channels;
+    std::uint32_t audio_sample_rate;
+    std::int32_t bitrate_max;
+    std::int32_t bitrate_nominal;
+    std::int32_t bitrate_min;
+    std::uint8_t blocksize_0; // read 4 bits, 2 exponent
+    std::uint8_t blocksize_1; // read 4 bits, 2 exponent
+    // + 1 bit framing flag (0x01 because of byte alignment)
+};
+
 struct VorbisSetupHeader
 {
+    std::size_t page_index;
+    std::size_t segment_index;
+
     std::vector<VorbisCodebook> codebooks;
     std::vector<VorbisFloor> floors;
     std::vector<VorbisResidue> residues;
     std::vector<VorbisMapping> mappings;
     std::vector<VorbisMode> modes;
-};
-
-enum class EVorbisDecodeState
-{
-    kIDHeader = 0,
-    kCommentHeader,
-    kSetupHeader,
-    kAudioDecode,
 };
 
 enum EVorbisError
@@ -394,6 +428,11 @@ enum EVorbisError
     kIncompleteHeader,
     kInvalidIDHeader,
     kInvalidSetupHeader,
+};
+
+enum FInvalidStream
+{
+    kUnexpectedNonAudioPacket = 0x1,
 };
 
 enum FInvalidIDHeader
@@ -723,21 +762,22 @@ EVorbisError VorbisCodebookDecode(std::uint8_t const* &_base_address,
     return EVorbisError::kNoError;
 }
 
-std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_header)
+std::uint32_t VorbisHeaders(PageContainer const &_pages,
+                            std::size_t &_page_index,
+                            std::size_t &_seg_index,
+                            VorbisIDHeader &o_id_header,
+                            VorbisSetupHeader &o_setup_header)
 {
     EVorbisError error_code = EVorbisError::kNoError;
     std::uint16_t error_flags = 0u;
 
-    std::size_t page_index = 0u;
-    std::size_t seg_index = 0u;
-
     {
-        std::size_t packet_size = _pages[page_index].segment_table[seg_index];
+        std::size_t packet_size = _pages[_page_index].segment_table[_seg_index];
 
         if (packet_size == 255u)
             return PackError(EVorbisError::kMissingHeader, 0u);
 
-        if (std::strncmp((char const*)_pages[page_index].stream_begin, "\x01vorbis", 7u))
+        if (std::strncmp((char const*)_pages[_page_index].stream_begin, "\x01vorbis", 7u))
             return PackError(EVorbisError::kMissingHeader, 0u);
 
         if (packet_size < VorbisIDHeader::kSizeOnStream + 7u)
@@ -745,11 +785,11 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
         if (packet_size > VorbisIDHeader::kSizeOnStream + 7u)
             std::cout << "[WARNING] Unexpected size for Vorbis ID header" << std::endl;
 
-        std::uint8_t const* read_position = _pages[page_index].stream_begin + 7u;
+        std::uint8_t const* read_position = _pages[_page_index].stream_begin + 7u;
         std::uint16_t error_flags = 0u;
 
-        o_id_header.page_index = page_index;
-        o_id_header.segment_index = seg_index;
+        o_id_header.page_index = _page_index;
+        o_id_header.segment_index = _seg_index;
 
         if (*(std::uint32_t const*)read_position != 0u)
             error_flags |= FInvalidIDHeader::kVorbisVersion;
@@ -786,56 +826,57 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
         if (error_flags)
             return PackError(EVorbisError::kInvalidIDHeader, error_flags);
 
-        if (++seg_index == _pages[page_index].segment_count)
+        if (++_seg_index == _pages[_page_index].segment_count)
         {
-            ++page_index;
-            seg_index = 0u;
+            ++_page_index;
+            _seg_index = 0u;
         }
     }
 
-    std::cout << "Page index " << page_index << " segment index " << seg_index << std::endl;
+    std::cout << "Page index " << _page_index << " segment index " << _seg_index << std::endl;
 
     std::size_t stream_offset = 0u;
     {
         std::size_t packet_size, page_end, seg_end;
-        error_code = ComputePacketSize(_pages, page_index, seg_index,
+        error_code = ComputePacketSize(_pages, _page_index, _seg_index,
                                        packet_size, page_end, seg_end);
         if (error_code != EVorbisError::kNoError)
             return PackError(error_code, 0u);
 
         std::cout << std::dec << "Page end " << page_end << " segment end " << seg_end << std::endl;
 
-        if (std::strncmp((char const*)_pages[page_index].stream_begin, "\x03vorbis", 7))
+        if (std::strncmp((char const*)_pages[_page_index].stream_begin, "\x03vorbis", 7))
             return PackError(EVorbisError::kMissingHeader, 0u);
 
-        std::cout << std::dec << "Comment header found page " << page_index << " segment " << seg_index << std::endl;
+        std::cout << std::dec << "Comment header found page " << _page_index << " segment " << _seg_index << std::endl;
         std::cout << std::dec << "Size is " << packet_size << " bytes" << std::endl;
 
-        page_index = page_end;
-        seg_index = seg_end;
+        _page_index = page_end;
+        _seg_index = seg_end;
         stream_offset = packet_size;
     }
 
     {
         std::size_t packet_size, page_end, seg_end;
-        error_code = ComputePacketSize(_pages, page_index, seg_index,
+        error_code = ComputePacketSize(_pages, _page_index, _seg_index,
                                        packet_size, page_end, seg_end);
         if (error_code != EVorbisError::kNoError)
             return PackError(error_code, 0u);
 
         std::cout << std::dec << "Page end " << page_end << " segment end " << seg_end << std::endl;
 
-        if (std::strncmp((char const*)_pages[page_index].stream_begin + stream_offset, "\x05vorbis", 7))
+        if (std::strncmp((char const*)_pages[_page_index].stream_begin + stream_offset, "\x05vorbis", 7))
             return PackError(EVorbisError::kMissingHeader, 0u);
 
-        std::cout << std::dec << "Setup header found page " << page_index << " segment " << seg_index << std::endl;
+        std::cout << std::dec << "Setup header found page " << _page_index << " segment " << _seg_index << std::endl;
         std::cout << std::dec << "Size is " << packet_size << " bytes" << std::endl;
 
-        std::uint8_t const* read_position = _pages[page_index].stream_begin + stream_offset + 7u;
+        std::uint8_t const* read_position = _pages[_page_index].stream_begin + stream_offset + 7u;
         int bit_offset = 0;
         int remaining_bits = (packet_size - 7) * 8;
 
-        VorbisSetupHeader o_setup_header;
+        o_setup_header.page_index = _page_index;
+        o_setup_header.segment_index = _seg_index;
 
         // =====================================================================
         // CODEBOOKS
@@ -1439,11 +1480,91 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages, VorbisIDHeader &o_id_he
         ReadBits(remaining_bits, read_position, bit_offset);
         std::cout << "Final bit offset " << bit_offset << std::endl;
 
-        page_index = page_end;
-        seg_index = seg_end;
+        _page_index = page_end;
+        _seg_index = seg_end;
     }
 
     return 0u;
+}
+
+std::uint32_t VorbisAudioDecode(PageContainer const &_pages,
+                                VorbisIDHeader const &_id,
+                                VorbisSetupHeader const &_setup,
+                                std::size_t &_page_index,
+                                std::size_t &_seg_index)
+{
+    PageDesc const& page = _pages[_page_index];
+
+    PrintPage(page);
+    std::cout << "Offset " << std::hex << debug_ComputeOffset(page, _seg_index) << std::endl;
+
+    if (_seg_index) { int* i = nullptr; *i = 0; }
+    std::uint8_t const* read_position = page.stream_begin;
+    int bit_offset = 0;
+
+    std::uint32_t packet_type = ReadBits(1, read_position, bit_offset);
+    if (packet_type)
+        return PackError(EVorbisError::kInvalidStream, FInvalidStream::kUnexpectedNonAudioPacket);
+
+    std::uint32_t mode_index = ReadBits(ilog(_setup.modes.size() - 1u),
+                                        read_position,
+                                        bit_offset);
+    std::cout << "Mode index " << mode_index << std::endl;
+
+    std::uint32_t blocksize = !_setup.modes[mode_index].blockflag ?
+        1u << _id.blocksize_0 :
+        1u << _id.blocksize_1;
+    std::cout << "Blocksize " << std::dec << (unsigned)blocksize << std::endl;
+
+    bool vorbis_mode_blockflag = _setup.modes[mode_index].blockflag;
+    bool previous_window_flag = false;
+    bool next_window_flag = false;
+
+    if (!_setup.modes[mode_index].blockflag)
+    {
+        previous_window_flag = ReadBits(1, read_position, bit_offset);
+        next_window_flag = ReadBits(1, read_position, bit_offset);
+        std::cout << "Previous window " << (int)previous_window_flag << std::endl;
+        std::cout << "Next window " << (int)next_window_flag << std::endl;
+    }
+
+    std::uint32_t window_center = blocksize / 2;
+
+    std::uint32_t left_window_start = 0u;
+    std::uint32_t left_window_end = window_center;
+    if (vorbis_mode_blockflag && !previous_window_flag)
+    {
+        left_window_start = blocksize / 4 - _id.blocksize_0 / 4;
+        left_window_end = blocksize / 4 + _id.blocksize_0 / 4;
+    }
+    std::uint32_t left_window_size = left_window_end - left_window_start;
+
+    std::uint32_t right_window_start = window_center;
+    std::uint32_t right_window_end = blocksize;
+    if (vorbis_mode_blockflag && !next_window_flag)
+    {
+        right_window_start = blocksize*3 / 4 - _id.blocksize_0 / 4;
+        right_window_end = blocksize*3 / 4 + _id.blocksize_0 / 4;
+    }
+    std::uint32_t right_window_size = right_window_end - right_window_start;
+
+    std::cout << "Window " << std::endl;
+    std::cout << blocksize << std::endl;
+    std::cout << "[";
+    for (std::uint32_t i = 0u; i < blocksize; ++i)
+    {
+        std::cout << WindowEval(i, left_window_start, left_window_end, right_window_start, right_window_end)
+                  << ", ";
+    }
+    std::cout << std::endl;
+
+    return 0u;
+
+#if 0
+    std::uint32_t ReadBits(int _count,
+                           std::uint8_t const* &_base_address,
+                           int &_bit_offset)
+#endif
 }
 
 int main(int argc, char** argv)
@@ -1503,13 +1624,25 @@ int main(int argc, char** argv)
 
     std::cout << std::hex << vorbis_serials.front() << std::endl;
 
+    std::size_t page_index = 0u;
+    std::size_t seg_index = 0u;
     VorbisIDHeader id_header;
-    std::uint32_t res = VorbisHeaders(ogg_pages.at(vorbis_serials.front()), id_header);
+    VorbisSetupHeader setup_header;
+    std::uint32_t res = VorbisHeaders(ogg_pages.at(vorbis_serials.front()),
+                                      page_index, seg_index,
+                                      id_header, setup_header);
     if (res >> 16u != EVorbisError::kNoError)
     {
         std::cout << "Vorbis error " << (res >> 16u) << std::endl;
-        // return 1;
+        return 1;
     }
+
+    std::cout << "Page " << page_index << " segment " << seg_index << std::endl;
+
+    res = VorbisAudioDecode(ogg_pages.at(vorbis_serials.front()),
+                            id_header,
+                            setup_header,
+                            page_index, seg_index);
 
     std::cout << "ID header : " << std::endl
               << std::dec
