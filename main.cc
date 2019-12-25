@@ -18,6 +18,8 @@
 #include <variant>
 #include <vector>
 
+#include <deque>
+
 enum class EOggDecodeState
 {
     kError = 0,
@@ -432,7 +434,9 @@ enum EVorbisError
 
 enum FInvalidStream
 {
-    kUnexpectedNonAudioPacket = 0x1,
+    kEndOfPacket = 0x1,
+    kUnexpectedNonAudioPacket = 0x2,
+    kUndecodablePacket = 0x4,
 };
 
 enum FInvalidIDHeader
@@ -564,6 +568,9 @@ EVorbisError ReadFields(std::uint8_t const* &_base_address,
         return EVorbisError::kEndOfStream;
 }
 #endif
+
+void FloorDecode(VorbisFloor::Floor0);
+void FloorDecode(VorbisFloor::Floor1);
 
 EVorbisError VorbisCodebookDecode(std::uint8_t const* &_base_address,
                                   int &_bit_offset,
@@ -1352,9 +1359,9 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages,
 
             std::cout << "Mapping submap count " << (unsigned)mapping.submap_count << std::endl;
 
+            mapping.muxes.resize(o_id_header.audio_channels);
             if (mapping.submap_count > 1)
             {
-                mapping.muxes.resize(o_id_header.audio_channels);
                 for (std::uint32_t channel_index = 0u;
                      channel_index < o_id_header.audio_channels; ++channel_index)
                 {
@@ -1369,6 +1376,8 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages,
                     mapping.muxes[channel_index] = mapping_mux;
                 }
             }
+            else
+                std::fill(mapping.muxes.begin(), mapping.muxes.end(), '\0');
 
             mapping.submap_floors.resize(mapping.submap_count);
             mapping.submap_residues.resize(mapping.submap_count);
@@ -1493,6 +1502,8 @@ std::uint32_t VorbisAudioDecode(PageContainer const &_pages,
                                 std::size_t &_page_index,
                                 std::size_t &_seg_index)
 {
+    EVorbisError error_code = EVorbisError::kNoError;
+
     PageDesc const& page = _pages[_page_index];
 
     PrintPage(page);
@@ -1502,26 +1513,72 @@ std::uint32_t VorbisAudioDecode(PageContainer const &_pages,
     std::uint8_t const* read_position = page.stream_begin;
     int bit_offset = 0;
 
+
+#if 0
+    std::size_t packet_size, page_end, seg_end;
+    error_code = ComputePacketSize(_pages, _page_index, _seg_index,
+                                   packet_size, page_end, seg_end);
+    if (error_code != EVorbisError::kNoError)
+        return PackError(error_code, 0u);
+
+    std::cout << "Packet size " << packet_size << std::endl;
+#else
+    std::size_t packet_size = 1;
+    while (packet_size == 1)
+    {
+        std::size_t page_end, seg_end;
+        error_code = ComputePacketSize(_pages, _page_index, _seg_index,
+                                       packet_size, page_end, seg_end);
+        if (error_code != EVorbisError::kNoError)
+            return PackError(error_code, 0u);
+
+        if (packet_size == 1)
+        {
+            _page_index = page_end;
+            _seg_index = seg_end;
+        }
+    }
+
+    std::cout << "Packet size " << packet_size << std::endl;
+#endif
+
+    int remaining_bits = packet_size * 8;
+
+    if (!remaining_bits)
+        return PackError(EVorbisError::kInvalidStream, FInvalidStream::kEndOfPacket);
+    --remaining_bits;
     std::uint32_t packet_type = ReadBits(1, read_position, bit_offset);
     if (packet_type)
         return PackError(EVorbisError::kInvalidStream, FInvalidStream::kUnexpectedNonAudioPacket);
 
-    std::uint32_t mode_index = ReadBits(ilog(_setup.modes.size() - 1u),
-                                        read_position,
-                                        bit_offset);
+    unsigned bits_read = ilog(_setup.modes.size() - 1u);
+    if (remaining_bits < bits_read)
+        return PackError(EVorbisError::kInvalidStream, FInvalidStream::kEndOfPacket);
+    remaining_bits -= bits_read;
+    std::uint32_t mode_index = ReadBits(bits_read, read_position, bit_offset);
     std::cout << "Mode index " << mode_index << std::endl;
 
-    std::uint32_t blocksize = !_setup.modes[mode_index].blockflag ?
+    VorbisMode const& mode = _setup.modes[mode_index];
+
+    std::uint32_t blocksize = !mode.blockflag ?
         1u << _id.blocksize_0 :
         1u << _id.blocksize_1;
     std::cout << "Blocksize " << std::dec << (unsigned)blocksize << std::endl;
 
-    bool vorbis_mode_blockflag = _setup.modes[mode_index].blockflag;
+    // =========================================================================
+    // WINDOW PARAMETERS
+    // =========================================================================
+
+    bool vorbis_mode_blockflag = mode.blockflag;
     bool previous_window_flag = false;
     bool next_window_flag = false;
 
-    if (!_setup.modes[mode_index].blockflag)
+    if (!mode.blockflag)
     {
+        if (remaining_bits < 2)
+            return PackError(EVorbisError::kInvalidStream, FInvalidStream::kEndOfPacket);
+        remaining_bits -= 2;
+
         previous_window_flag = ReadBits(1, read_position, bit_offset);
         next_window_flag = ReadBits(1, read_position, bit_offset);
         std::cout << "Previous window " << (int)previous_window_flag << std::endl;
@@ -1537,7 +1594,6 @@ std::uint32_t VorbisAudioDecode(PageContainer const &_pages,
         left_window_start = blocksize / 4 - _id.blocksize_0 / 4;
         left_window_end = blocksize / 4 + _id.blocksize_0 / 4;
     }
-    std::uint32_t left_window_size = left_window_end - left_window_start;
 
     std::uint32_t right_window_start = window_center;
     std::uint32_t right_window_end = blocksize;
@@ -1546,7 +1602,6 @@ std::uint32_t VorbisAudioDecode(PageContainer const &_pages,
         right_window_start = blocksize*3 / 4 - _id.blocksize_0 / 4;
         right_window_end = blocksize*3 / 4 + _id.blocksize_0 / 4;
     }
-    std::uint32_t right_window_size = right_window_end - right_window_start;
 
     std::cout << "Window " << std::endl;
     std::cout << blocksize << std::endl;
@@ -1558,13 +1613,106 @@ std::uint32_t VorbisAudioDecode(PageContainer const &_pages,
     }
     std::cout << std::endl;
 
-    return 0u;
+    std::cout << "Remaining bits " << remaining_bits << std::endl;
+
+    // =========================================================================
+    // FLOOR CURVE
+    // =========================================================================
+
+    VorbisMapping const& mapping = _setup.mappings[mode.mapping];
+
+    for (unsigned i = 0; i < _id.audio_channels; ++i)
+    {
+        std::uint8_t submap_floor_index = mapping.submap_floors[i];
+        VorbisFloor const& floor_container = _setup.floors[submap_floor_index];
+        // ERROR: _setup.floors[1] uninitialized on 32_test.ogg
+        std::cout << floor_container.type << std::endl;
 
 #if 0
-    std::uint32_t ReadBits(int _count,
-                           std::uint8_t const* &_base_address,
-                           int &_bit_offset)
+        std::uint8_t submap_mux_index = mapping.muxes[i];
+        // according to floor.type, call the appropriate floor decode function
+        switch (floor_container.type)
+        {
+        case 0:
+        {
+            std::cout << "floor0" << std::endl;
+            std::cout << floor_container.type << std::endl;
+            VorbisFloor::Floor0 const& floor = std::get<0>(floor_container.data);
+            std::cout << "after" << std::endl;
+
+            if (remaining_bits < floor.amplitude_bits)
+                return PackError(EVorbisError::kInvalidStream, FInvalidStream::kEndOfPacket);
+            std::uint32_t amplitude = ReadBits(floor.amplitude_bits, read_position, remaining_bits);
+            remaining_bits -= floor.amplitude_bits;
+
+            if (amplitude)
+            {
+                //std::vector<> coefficients;
+                unsigned bit_count = ilog(floor.book_count);
+                if (remaining_bits < bit_count)
+                    return PackError(EVorbisError::kInvalidStream, FInvalidStream::kEndOfPacket);
+                std::uint32_t book_index = ReadBits(bit_count, read_position, remaining_bits);
+                remaining_bits -= bit_count;
+
+                if (book_index >= _setup.codebooks.size())
+                    return PackError(EVorbisError::kInvalidStream, FInvalidStream::kUndecodablePacket);
+
+                std::cout << "Offset " << std::hex << debug_ComputeOffset(page, _seg_index) + (read_position - &page.segment_table[_seg_index]) << std::endl;
+            }
+        } break;
+
+        case 1:
+        {
+        } break;
+        default: break;
+        }
 #endif
+    }
+
+    return 0u;
+}
+
+
+struct BinaryNode { std::uint32_t v = -1u; std::size_t left = 0u, right = 0u; };
+
+std::vector<BinaryNode> BuildHuffmanTree(std::vector<std::uint8_t> const& _lengths)
+{
+    std::vector<BinaryNode> tree(1);
+    tree.reserve(_lengths.size() * 2u);
+    std::unordered_map<std::uint8_t, std::uint32_t> leaves{};
+
+    for (std::uint8_t length : _lengths)
+    {
+        std::uint32_t codeword = 0u;
+        for (auto pair : leaves)
+        {
+            int diff = length - pair.first;
+            if (length > pair.first)
+                codeword = std::max(codeword, ((pair.second + 1) << diff));
+            else
+                codeword = std::max(codeword, (pair.second >> -diff) + 1);
+        }
+
+        std::size_t nindex = 0;
+        for (int bindex = length-1; bindex >= 0; --bindex)
+        {
+            bool bit = (codeword >> (bindex)) & 1u;
+            std::size_t &next_node = (!bit) ? tree[nindex].left : tree[nindex].right;
+            if (!next_node)
+            {
+                tree.emplace_back();
+                next_node = tree.size()-1u;
+            }
+            nindex = next_node;
+        }
+
+        if (tree[nindex].left || tree[nindex].right)
+            std::cout << "error" << std::endl;
+        tree[nindex].v = (codeword << (32 - length));
+        leaves[length] = codeword;
+    }
+
+    return tree;
 }
 
 int main(int argc, char** argv)
@@ -1639,10 +1787,53 @@ int main(int argc, char** argv)
 
     std::cout << "Page " << page_index << " segment " << seg_index << std::endl;
 
+    auto test_tree = BuildHuffmanTree({2, 4, 4, 4, 4, 2, 3, 3});
+#if 0
+    {
+        struct noname { int depth = 1; int side = 0; std::size_t node = 0u; };
+        std::deque<noname> queue(1);
+        std::uint32_t codeword = 0u;
+        int depth = 1;
+        while (!queue.empty())
+        {
+            noname head = queue.front();
+            queue.pop_front();
+            BinaryNode &node = test_tree[head.node];
+
+            codeword &= ((int)0x800000000 >> (head.depth - 1)) & ~(0x80000000u >> (head.depth - 1));
+            codeword |= (0x80000000u >> (head.depth - 1)) * head.side;
+            depth = head.depth;
+
+            if (!node.left && !node.right)
+            {
+                std::cout << std::hex << (unsigned)codeword << std::endl;
+            }
+            else
+            {
+                if (node.right)
+                    queue.emplace_back(noname{ depth+1, 1, node.right });
+                if (node.left)
+                    queue.emplace_back(noname{ depth+1, 0, node.left });
+            }
+        }
+    }
+#endif
+
+    std::cout << "huffman begin" << std::endl;
+    test_tree = BuildHuffmanTree(setup_header.codebooks[0].entry_lengths);
+    for (BinaryNode const&node : test_tree)
+    {
+        if (node.v != -1u)
+            std::cout << std::hex << (unsigned)node.v << std::endl;
+    }
+
+
+#if 0
     res = VorbisAudioDecode(ogg_pages.at(vorbis_serials.front()),
                             id_header,
                             setup_header,
                             page_index, seg_index);
+#endif
 
     std::cout << "ID header : " << std::endl
               << std::dec
