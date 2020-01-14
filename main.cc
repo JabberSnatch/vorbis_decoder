@@ -8,6 +8,8 @@
  */
 
 #include <algorithm>
+#include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -18,7 +20,35 @@
 #include <variant>
 #include <vector>
 
-#include <deque>
+// =============================================================================
+// HUFFMAN CODING
+// =============================================================================
+
+struct BinaryNode
+{
+    std::uint32_t v = -1u;
+    std::uint8_t length = 0u;
+    std::size_t left = 0u, right = 0u;
+};
+
+std::vector<BinaryNode> BuildHuffmanTree(std::vector<std::uint8_t> const& _lengths);
+
+struct HuffmanLUT
+{
+    std::vector<std::uint32_t> entries;
+    std::vector<std::uint32_t> lengths;
+    std::vector<std::uint32_t> indices;
+};
+
+HuffmanLUT Huffman_BuildLookupTable(std::vector<BinaryNode> const& _tree);
+std::uint32_t Huffman_ReadEntry(HuffmanLUT const& _lut,
+                                std::uint8_t const* &_base_address,
+                                int &_bit_offset,
+                                int &o_bits_read);
+
+// =============================================================================
+// OGG FILE FORMAT
+// =============================================================================
 
 enum class EOggDecodeState
 {
@@ -56,9 +86,6 @@ struct PageDesc
     std::uint8_t const* stream_begin = nullptr;
 };
 
-using PageContainer = std::vector<PageDesc>;
-using OggContents = std::unordered_map<std::uint32_t, PageContainer>;
-
 int debug_PageCount = 0;
 std::uint8_t* debug_baseBuff;
 
@@ -71,56 +98,8 @@ std::ptrdiff_t debug_ComputeOffset(PageDesc const& _page, std::size_t _seg_index
     return (_page.stream_begin + byte_offset) - debug_baseBuff;
 }
 
-constexpr unsigned ilog(std::uint32_t _v)
-{
-    unsigned res = 0u;
-    for (; _v; _v = _v >> 1u, ++res);
-    return res;
-}
-
-constexpr std::uint32_t lookup1_values(std::uint32_t _entry_count, std::uint16_t _dimensions)
-{
-    if (_dimensions == 0u)
-        return 0u;
-    if (_dimensions == 1u)
-        return _entry_count;
-    if (_dimensions == 2u)
-        return static_cast<std::uint32_t>(std::floor(std::sqrt(_entry_count)));
-
-    float const f_entry_count = (float)_entry_count;
-    float const f_dimensions = (float)_dimensions;
-    float f_result = 1.f;
-    while (std::pow(f_result, f_dimensions) <= f_entry_count)
-        f_result += 1.f; // NOTE: _entry_count should be 24 bits
-    return static_cast<std::uint32_t>(f_result) - 1u;
-}
-
-float WindowEval(std::uint32_t _n,
-                 std::uint32_t _lws, std::uint32_t _lwe,
-                 std::uint32_t _rws, std::uint32_t _rwe)
-{
-    constexpr float piOver2 = 3.1415926536f * .5f;
-
-    if (_n >= _rwe)
-        return 0.f;
-
-    if (_n >= _rws)
-    {
-        float t0 = std::sin(((float)(_n - _rws) + .5f) / (float)(_rwe-_rws) * piOver2 + piOver2);
-        return std::sin(piOver2 * t0*t0);
-    }
-
-    if (_n >= _lwe)
-        return 1.f;
-
-    if (_n >= _lws)
-    {
-        float t0 = std::sin(((float)(_n - _lws) + .5f) / (float)(_lwe-_lws) * piOver2);
-        return std::sin(piOver2 * t0*t0);
-    }
-
-    return 0.f;
-}
+using PageContainer = std::vector<PageDesc>;
+using OggContents = std::unordered_map<std::uint32_t, PageContainer>;
 
 OggContents DecodeOgg(std::uint8_t const* _buff, std::size_t _size)
 {
@@ -302,6 +281,61 @@ void PrintPages(PageContainer const &_pages)
     std::for_each(std::cbegin(_pages), std::cend(_pages), PrintPage);
 }
 
+// =============================================================================
+// VORBIS DECODER
+// =============================================================================
+
+constexpr unsigned ilog(std::uint32_t _v)
+{
+    unsigned res = 0u;
+    for (; _v; _v = _v >> 1u, ++res);
+    return res;
+}
+
+constexpr std::uint32_t lookup1_values(std::uint32_t _entry_count, std::uint16_t _dimensions)
+{
+    if (_dimensions == 0u)
+        return 0u;
+    if (_dimensions == 1u)
+        return _entry_count;
+    if (_dimensions == 2u)
+        return static_cast<std::uint32_t>(std::floor(std::sqrt(_entry_count)));
+
+    float const f_entry_count = (float)_entry_count;
+    float const f_dimensions = (float)_dimensions;
+    float f_result = 1.f;
+    while (std::pow(f_result, f_dimensions) <= f_entry_count)
+        f_result += 1.f; // NOTE: _entry_count should be 24 bits
+    return static_cast<std::uint32_t>(f_result) - 1u;
+}
+
+float WindowEval(std::uint32_t _n,
+                 std::uint32_t _lws, std::uint32_t _lwe,
+                 std::uint32_t _rws, std::uint32_t _rwe)
+{
+    constexpr float piOver2 = 3.1415926536f * .5f;
+
+    if (_n >= _rwe)
+        return 0.f;
+
+    if (_n >= _rws)
+    {
+        float t0 = std::sin(((float)(_n - _rws) + .5f) / (float)(_rwe-_rws) * piOver2 + piOver2);
+        return std::sin(piOver2 * t0*t0);
+    }
+
+    if (_n >= _lwe)
+        return 1.f;
+
+    if (_n >= _lws)
+    {
+        float t0 = std::sin(((float)(_n - _lws) + .5f) / (float)(_lwe-_lws) * piOver2);
+        return std::sin(piOver2 * t0*t0);
+    }
+
+    return 0.f;
+}
+
 struct VorbisCodebook
 {
     std::uint16_t dimensions;
@@ -338,7 +372,7 @@ struct VorbisFloor
         {
             std::uint8_t dimensions;
             std::uint8_t subclass_logcount;
-            std::uint8_t masterbook_count;
+            std::uint8_t masterbook;
             std::vector<std::uint8_t> subclass_codebooks;
         };
 
@@ -437,6 +471,7 @@ enum FInvalidStream
     kEndOfPacket = 0x1,
     kUnexpectedNonAudioPacket = 0x2,
     kUndecodablePacket = 0x4,
+    kUnknownCodeword = 0x8,
 };
 
 enum FInvalidIDHeader
@@ -568,9 +603,6 @@ EVorbisError ReadFields(std::uint8_t const* &_base_address,
         return EVorbisError::kEndOfStream;
 }
 #endif
-
-void FloorDecode(VorbisFloor::Floor0);
-void FloorDecode(VorbisFloor::Floor1);
 
 EVorbisError VorbisCodebookDecode(std::uint8_t const* &_base_address,
                                   int &_bit_offset,
@@ -1060,13 +1092,13 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages,
                     remaining_bits -= 2;
                     floor_class.subclass_logcount = (std::uint8_t)ReadBits(2, read_position, bit_offset);
 
-                    floor_class.masterbook_count = 0u;
+                    floor_class.masterbook = 0u;
                     if (floor_class.subclass_logcount)
                     {
                         if (remaining_bits < 8)
                             return PackError(EVorbisError::kIncompleteHeader, 0u);
                         remaining_bits -= 8;
-                        floor_class.masterbook_count = (std::uint8_t)ReadBits(8, read_position, bit_offset);
+                        floor_class.masterbook = (std::uint8_t)ReadBits(8, read_position, bit_offset);
                     }
 
                     floor_class.subclass_codebooks.resize(1u << floor_class.subclass_logcount);
@@ -1513,16 +1545,6 @@ std::uint32_t VorbisAudioDecode(PageContainer const &_pages,
     std::uint8_t const* read_position = page.stream_begin;
     int bit_offset = 0;
 
-
-#if 0
-    std::size_t packet_size, page_end, seg_end;
-    error_code = ComputePacketSize(_pages, _page_index, _seg_index,
-                                   packet_size, page_end, seg_end);
-    if (error_code != EVorbisError::kNoError)
-        return PackError(error_code, 0u);
-
-    std::cout << "Packet size " << packet_size << std::endl;
-#else
     std::size_t packet_size = 1;
     while (packet_size == 1)
     {
@@ -1540,7 +1562,6 @@ std::uint32_t VorbisAudioDecode(PageContainer const &_pages,
     }
 
     std::cout << "Packet size " << packet_size << std::endl;
-#endif
 
     int remaining_bits = packet_size * 8;
 
@@ -1621,24 +1642,21 @@ std::uint32_t VorbisAudioDecode(PageContainer const &_pages,
 
     VorbisMapping const& mapping = _setup.mappings[mode.mapping];
 
+    while (remaining_bits) {
+
     for (unsigned i = 0; i < _id.audio_channels; ++i)
     {
-        std::uint8_t submap_floor_index = mapping.submap_floors[i];
-        VorbisFloor const& floor_container = _setup.floors[submap_floor_index];
-        // ERROR: _setup.floors[1] uninitialized on 32_test.ogg
-        std::cout << floor_container.type << std::endl;
+        std::uint8_t const submap_index = mapping.muxes[i];
+        std::uint8_t const floor_index = mapping.submap_floors[submap_index];
+        VorbisFloor const& floor_container = _setup.floors[floor_index];
 
-#if 0
-        std::uint8_t submap_mux_index = mapping.muxes[i];
+        bool unused = false;
         // according to floor.type, call the appropriate floor decode function
         switch (floor_container.type)
         {
         case 0:
         {
-            std::cout << "floor0" << std::endl;
-            std::cout << floor_container.type << std::endl;
             VorbisFloor::Floor0 const& floor = std::get<0>(floor_container.data);
-            std::cout << "after" << std::endl;
 
             if (remaining_bits < floor.amplitude_bits)
                 return PackError(EVorbisError::kInvalidStream, FInvalidStream::kEndOfPacket);
@@ -1663,57 +1681,262 @@ std::uint32_t VorbisAudioDecode(PageContainer const &_pages,
 
         case 1:
         {
+            VorbisFloor::Floor1 const& floor = std::get<1>(floor_container.data);
+
+            bool nonzero = false;
+            if (remaining_bits)
+            {
+                nonzero = ReadBits(1, read_position, bit_offset);
+                --remaining_bits;
+            }
+
+            if (nonzero)
+            {
+                static const std::uint32_t kRanges[] = { 256, 128, 86, 64 };
+
+                std::uint32_t range = kRanges[floor.multiplier-1];
+                std::uint32_t bit_count = ilog(range-1);
+                std::vector<std::uint32_t> yvalues(2);
+
+                if (remaining_bits < bit_count) {
+                    nonzero = false; break;
+                }
+                yvalues[0] = ReadBits(bit_count, read_position, bit_offset);
+                remaining_bits -= bit_count;
+
+                if (remaining_bits < bit_count) {
+                    nonzero = false; break;
+                }
+                yvalues[1] = ReadBits(bit_count, read_position, bit_offset);
+                remaining_bits -= bit_count;
+
+                std::size_t yindex = 2;
+                for (std::uint8_t i = 0u; i < floor.partition_count; ++i)
+                {
+                    VorbisFloor::Floor1::Class partition_class = floor.classes[floor.partition_classes[i]];
+                    std::uint8_t cdim = partition_class.dimensions;
+                    std::uint8_t cbits = partition_class.subclass_logcount;
+                    std::uint32_t csub = (1u << cbits) - 1u;
+                    std::uint32_t cval = 0u;
+                    if (cbits > 0)
+                    {
+                        VorbisCodebook const& codebook = _setup.codebooks[partition_class.masterbook];
+                        HuffmanLUT codebook_lut = Huffman_BuildLookupTable(BuildHuffmanTree(codebook.entry_lengths));
+
+                        int bits_read = 0;
+                        cval = Huffman_ReadEntry(codebook_lut, read_position, bit_offset, bits_read);
+                        if (remaining_bits < bits_read) {
+                            nonzero = false; break;
+                        }
+                        if (bits_read < 0) return cval;
+                        remaining_bits -= bits_read;
+                    }
+
+                    yvalues.resize(yindex + cdim);
+                    for (std::uint8_t j = 0u; j < cdim; ++j)
+                    {
+                        std::uint32_t subbook_index = cval & csub;
+                        std::uint8_t codebook_index = partition_class.subclass_codebooks[subbook_index];
+                        cval = cval >> cbits;
+                        if (codebook_index != 0xff)
+                        {
+                            VorbisCodebook const& codebook = _setup.codebooks[codebook_index];
+                            HuffmanLUT codebook_lut = Huffman_BuildLookupTable(BuildHuffmanTree(codebook.entry_lengths));
+
+                            int bits_read = 0;
+                            yvalues[yindex + j] = Huffman_ReadEntry(codebook_lut, read_position, bit_offset, bits_read);
+                            if (remaining_bits < bits_read) {
+                                nonzero = false; break;
+                            }
+                            if (bits_read < 0) return yvalues[yindex + j];
+                            remaining_bits -= bits_read;
+                        }
+                        else
+                        {
+                            yvalues[yindex + j] = 0u;
+                        }
+                    }
+                    yindex += cdim;
+                }
+            }
         } break;
         default: break;
         }
-#endif
+    }
     }
 
     return 0u;
 }
 
-
-struct BinaryNode { std::uint32_t v = -1u; std::size_t left = 0u, right = 0u; };
-
 std::vector<BinaryNode> BuildHuffmanTree(std::vector<std::uint8_t> const& _lengths)
 {
     std::vector<BinaryNode> tree(1);
     tree.reserve(_lengths.size() * 2u);
-    std::unordered_map<std::uint8_t, std::uint32_t> leaves{};
 
+    std::uint32_t entry_count = 0u;
     for (std::uint8_t length : _lengths)
     {
-        std::uint32_t codeword = 0u;
-        for (auto pair : leaves)
-        {
-            int diff = length - pair.first;
-            if (length > pair.first)
-                codeword = std::max(codeword, ((pair.second + 1) << diff));
-            else
-                codeword = std::max(codeword, (pair.second >> -diff) + 1);
-        }
+        if (length == 0u) continue;
+        ++entry_count;
 
-        std::size_t nindex = 0;
-        for (int bindex = length-1; bindex >= 0; --bindex)
+        std::vector<std::size_t> path{ 0u };
+        while (path.back() < -2u)
         {
-            bool bit = (codeword >> (bindex)) & 1u;
-            std::size_t &next_node = (!bit) ? tree[nindex].left : tree[nindex].right;
-            if (!next_node)
+            std::size_t nindex = path.back();
+            if ((path.size() > 1u && !tree[nindex].left && !tree[nindex].right) ||
+                (path.size() == length+1))
             {
-                tree.emplace_back();
-                next_node = tree.size()-1u;
+                path.pop_back();
+                while (tree[path.back()].right == nindex)
+                {
+                    nindex = path.back();
+                    path.pop_back();
+                }
+                if (path.empty())
+                    return std::vector<BinaryNode>{};
+
+                nindex = path.back();
+
+                if (tree[nindex].right)
+                    path.push_back(tree[nindex].right);
+                else
+                    path.push_back(-2u);
             }
-            nindex = next_node;
+            else
+            {
+                if (tree[nindex].left)
+                    path.push_back(tree[nindex].left);
+                else
+                    path.push_back(-1u);
+            }
+
+            assert(path.back() <= -1u);
+            assert(path.size() <= length+1);
         }
 
-        if (tree[nindex].left || tree[nindex].right)
-            std::cout << "error" << std::endl;
-        tree[nindex].v = (codeword << (32 - length));
-        leaves[length] = codeword;
+        std::uint32_t codeword = 0u;
+        for (int i = 1; i < path.size()-1; ++i)
+        {
+            std::uint32_t bit = (path[i] == tree[path[i-1]].left) ? 0u : 1u;
+            codeword |= bit << (length-i);
+        }
+
+        std::size_t nindex = *std::next(path.rbegin(), 1);
+        tree.emplace_back();
+        if (path.back() == -2u)
+        {
+            codeword |= 1u << ((length+1)-path.size());
+            assert(!tree[nindex].right);
+            tree[nindex].right = tree.size()-1u;
+            nindex = tree[nindex].right;
+        }
+        else
+        {
+            assert(!tree[nindex].left);
+            tree[nindex].left = tree.size()-1u;
+            nindex = tree[nindex].left;
+        }
+
+        for (int i = 0; i < (length - (path.size()-1)); ++i)
+        {
+            tree.emplace_back();
+            tree[nindex].left = tree.size()-1u;
+            nindex = tree[nindex].left;
+        }
+
+        tree[nindex].v = codeword << (32 - length);
+        tree[nindex].length = length;
+        assert(!tree[nindex].left && !tree[nindex].right);
     }
+
+    for (BinaryNode const &node : tree)
+    {
+        assert((!node.left && !node.right) ||
+               (node.left && node.right));
+    }
+    assert(tree.size() == (entry_count * 2u)-1u);
 
     return tree;
 }
+
+HuffmanLUT Huffman_BuildLookupTable(std::vector<BinaryNode> const& _tree)
+{
+    HuffmanLUT result;
+    result.entries.reserve((_tree.size() + 1)/2);
+    result.lengths.reserve((_tree.size() + 1)/2);
+    result.indices.reserve((_tree.size() + 1)/2);
+
+    std::uint32_t node_index = 0u;
+    for (BinaryNode const& node : _tree)
+    {
+        if (node.v == -1u) continue;
+
+        auto entry_it = std::lower_bound(result.entries.begin(), result.entries.end(), node.v);
+        auto entry_index = std::distance(result.entries.begin(), entry_it);
+        auto lengths_it = std::next(result.lengths.begin(), entry_index);
+        auto indices_it = std::next(result.indices.begin(), entry_index);
+        result.entries.insert(entry_it, node.v);
+        result.lengths.insert(lengths_it, node.length);
+        result.indices.insert(indices_it, node_index++);
+    }
+
+    return result;
+}
+
+std::uint32_t Huffman_ReadEntry(HuffmanLUT const& _lut,
+                                std::uint8_t const* &_base_address,
+                                int &_bit_offset,
+                                int &o_bits_read)
+{
+    std::uint32_t buffer = 0u;
+    int bits_read = 0;
+    auto entry_it = std::prev(_lut.entries.end());
+    auto length_it = _lut.lengths.begin();
+
+    while (!(*length_it == bits_read && *entry_it == buffer))
+    {
+        buffer |= (ReadBits(1, _base_address, _bit_offset) << (31-bits_read++));
+        entry_it = std::lower_bound(_lut.entries.begin(), _lut.entries.end(), buffer);
+        length_it = std::next(_lut.lengths.begin(), std::distance(_lut.entries.begin(), entry_it));
+
+        if (bits_read > 31)
+        {
+            o_bits_read = -1;
+            return PackError(EVorbisError::kInvalidStream, FInvalidStream::kUnknownCodeword);
+        }
+    }
+
+    o_bits_read = bits_read-1;
+    return *std::next(_lut.indices.begin(), std::distance(_lut.entries.begin(), entry_it));
+}
+
+void Huffman_FunctionalTest()
+{
+    auto test_tree = BuildHuffmanTree({2, 2, 2, 2, 2});
+    assert(test_tree.empty());
+
+    test_tree = BuildHuffmanTree({2, 4, 4, 4, 4, 2, 3, 3});
+
+    std::cout << "huffman begin" << std::endl;
+    for (BinaryNode const&node : test_tree)
+    {
+        if (node.v != -1u)
+        {
+            std::cout << std::dec << (unsigned)node.length << " "
+                      << std::hex << (unsigned)node.v << std::endl;
+        }
+    }
+    auto test_lut = Huffman_BuildLookupTable(test_tree);
+    std::uint32_t test_value = 0x00000001;
+    std::uint8_t const* dummy_buff = (std::uint8_t const*)&test_value;
+    int bit_offset = 0;
+    int bits_read = 0;
+    std::uint32_t entry = Huffman_ReadEntry(test_lut,
+                                            dummy_buff,
+                                            bit_offset,
+                                            bits_read);
+    assert(entry == 5);
+};
 
 int main(int argc, char** argv)
 {
@@ -1787,53 +2010,47 @@ int main(int argc, char** argv)
 
     std::cout << "Page " << page_index << " segment " << seg_index << std::endl;
 
-    auto test_tree = BuildHuffmanTree({2, 4, 4, 4, 4, 2, 3, 3});
 #if 0
+    for (VorbisCodebook const& codebook : setup_header.codebooks)
     {
-        struct noname { int depth = 1; int side = 0; std::size_t node = 0u; };
-        std::deque<noname> queue(1);
-        std::uint32_t codeword = 0u;
-        int depth = 1;
-        while (!queue.empty())
+        using StdClock_t = std::chrono::high_resolution_clock;
+        StdClock_t::time_point begin = StdClock_t::now();
+        auto data_tree = BuildHuffmanTree(codebook.entry_lengths);
+        auto data_lut = Huffman_BuildLookupTable(data_tree);
+        StdClock_t::time_point end = StdClock_t::now();
+        std::cout << "BuildHuffmanTree(), size=" << data_tree.size()
+                  << "; time=" << std::chrono::duration_cast<std::chrono::milliseconds>(end-begin).count() << std::endl;
+
+        for (BinaryNode const&node : data_tree)
         {
-            noname head = queue.front();
-            queue.pop_front();
-            BinaryNode &node = test_tree[head.node];
-
-            codeword &= ((int)0x800000000 >> (head.depth - 1)) & ~(0x80000000u >> (head.depth - 1));
-            codeword |= (0x80000000u >> (head.depth - 1)) * head.side;
-            depth = head.depth;
-
-            if (!node.left && !node.right)
+            if (node.v != -1u)
             {
-                std::cout << std::hex << (unsigned)codeword << std::endl;
+                std::cout << std::dec << (unsigned)node.length << " "
+                          << std::hex << (unsigned)node.v << std::endl;
             }
-            else
-            {
-                if (node.right)
-                    queue.emplace_back(noname{ depth+1, 1, node.right });
-                if (node.left)
-                    queue.emplace_back(noname{ depth+1, 0, node.left });
-            }
+        }
+        for (int i = 0; i < data_lut.entries.size(); ++i)
+        {
+            std::uint32_t mask = ((1u << data_lut.lengths[i]) - 1u) << (32-data_lut.lengths[i]);
+            std::cout << std::dec << i << " "
+                      << std::hex << data_lut.entries[i] << " " << mask << std::endl;
         }
     }
 #endif
 
-    std::cout << "huffman begin" << std::endl;
-    test_tree = BuildHuffmanTree(setup_header.codebooks[0].entry_lengths);
-    for (BinaryNode const&node : test_tree)
-    {
-        if (node.v != -1u)
-            std::cout << std::hex << (unsigned)node.v << std::endl;
-    }
-
-
-#if 0
     res = VorbisAudioDecode(ogg_pages.at(vorbis_serials.front()),
                             id_header,
                             setup_header,
                             page_index, seg_index);
-#endif
+
+    if (!res)
+    {
+        seg_index = 0;
+        res = VorbisAudioDecode(ogg_pages.at(vorbis_serials.front()),
+                                id_header,
+                                setup_header,
+                                ++page_index, seg_index);
+    }
 
     std::cout << "ID header : " << std::endl
               << std::dec
