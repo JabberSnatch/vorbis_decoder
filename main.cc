@@ -309,6 +309,41 @@ constexpr std::uint32_t lookup1_values(std::uint32_t _entry_count, std::uint16_t
     return static_cast<std::uint32_t>(f_result) - 1u;
 }
 
+inline std::size_t low_neighbour(std::vector<std::uint32_t> const& _values, std::size_t _index)
+{
+    std::size_t n = -1u;
+    for (std::size_t i = 0u; i < _index; ++i)
+        if (_values[i] < _values[_index] &&
+            (n == -1u || _values[i] > _values[n]))
+            n = i;
+    return n;
+}
+
+inline std::size_t high_neighbour(std::vector<std::uint32_t> const& _values, std::size_t _index)
+{
+    std::size_t n = -1u;
+    for (std::size_t i = 0u; i < _index; ++i)
+        if (_values[i] > _values[_index] &&
+            (n == -1u || _values[i] < _values[n]))
+            n = i;
+    return n;
+}
+
+std::uint32_t render_point(std::uint32_t x0, std::uint32_t y0,
+                           std::uint32_t x1, std::uint32_t y1,
+                           std::uint32_t x)
+{
+    std::int32_t dy = y1 - y0;
+    std::int32_t adx = x1 - x0;
+    std::int32_t ady = std::abs(dy);
+    std::int32_t err = ady * (x - x0);
+    std::int32_t off = err / adx;
+    if (dy < 0)
+        return (std::uint32_t)std::max(0u, y0 - off);
+    else
+        return (std::uint32_t)std::max(0u, y0 + off);
+}
+
 float WindowEval(std::uint32_t _n,
                  std::uint32_t _lws, std::uint32_t _lwe,
                  std::uint32_t _rws, std::uint32_t _rwe)
@@ -381,7 +416,7 @@ struct VorbisFloor
         std::vector<Class> classes;
         std::uint8_t multiplier;
         std::uint32_t value_count;
-        std::vector<std::uint16_t> values;
+        std::vector<std::uint32_t> values;
     };
 
     std::uint16_t type;
@@ -1153,9 +1188,17 @@ std::uint32_t VorbisHeaders(PageContainer const &_pages,
                             return PackError(EVorbisError::kIncompleteHeader, 0u);
                         remaining_bits -= range_bits;
                         floor1.values[floor1_value_index++] =
-                            (std::uint16_t)ReadBits(range_bits, read_position, bit_offset);
+                            (std::uint32_t)ReadBits(range_bits, read_position, bit_offset);
                     }
                 }
+
+                if (floor1_value_index > 65)
+                    return PackError(EVorbisError::kInvalidSetupHeader, 0u);
+
+                for (int i = 0; i < floor1_value_index-1; ++i)
+                    for (int j = i+1; j < floor1_value_index; ++j)
+                        if (floor1.values[i] == floor1.values[j])
+                            return PackError(EVorbisError::kInvalidSetupHeader, 0u);
             }
 
             else
@@ -1758,6 +1801,59 @@ std::uint32_t VorbisAudioDecode(PageContainer const &_pages,
                     }
                     yindex += cdim;
                 }
+
+                assert(nonzero);
+                // Amplitude value synthesis
+                std::vector<bool> step2_flag(yvalues.size());
+                step2_flag[0] = true; step2_flag[1] = true;
+                std::vector<std::uint32_t> final_yvalues(yvalues.size());
+                final_yvalues[0] = yvalues[0]; final_yvalues[1] = yvalues[1];
+                for (std::size_t i = 2; i < yvalues.size(); ++i)
+                {
+                    std::size_t ln_offset = low_neighbour(floor.values, i);
+                    std::size_t hn_offset = high_neighbour(floor.values, i);
+
+                    std::int32_t predicted = (std::int32_t)render_point(floor.values[ln_offset],
+                                                                        final_yvalues[ln_offset],
+                                                                        floor.values[hn_offset],
+                                                                        final_yvalues[hn_offset],
+                                                                        floor.values[i]);
+
+                    std::int32_t val = (std::int32_t)yvalues[i];
+
+                    std::int32_t highroom = (std::int32_t)range - predicted;
+                    std::int32_t lowroom = (std::int32_t)predicted;
+                    std::int32_t room = std::min(highroom, lowroom) * 2;
+
+                    if (val)
+                    {
+                        step2_flag[ln_offset] = true;
+                        step2_flag[hn_offset] = true;
+                        step2_flag[i] = true;
+                        if (val >= room)
+                        {
+                            if (highroom > lowroom)
+                                final_yvalues[i] = std::min(range, (std::uint32_t)std::max(0, val));
+                            else
+                                final_yvalues[i] = std::min(range, (std::uint32_t)std::max(0, predicted - (val - highroom) - 1));
+                        }
+                        else
+                        {
+                            if (val & 0x1)
+                                final_yvalues[i] = std::min(range, (std::uint32_t)std::max(0, predicted - ((val + 1) / 2)));
+                            else
+                                final_yvalues[i] = std::min(range, (std::uint32_t)std::max(0, predicted + (val / 2)));
+                        }
+                    }
+                    else
+                    {
+                        step2_flag[i] = false;
+                        final_yvalues[i] = std::min(range, (std::uint32_t)std::max(0, predicted));
+                    }
+                }
+
+                // Curve synthesis
+                std::vector<int32_t> floor_vector(blocksize);
             }
         } break;
         default: break;
@@ -2042,6 +2138,7 @@ int main(int argc, char** argv)
                             id_header,
                             setup_header,
                             page_index, seg_index);
+    std::cout << "AudioDecode output " << res << std::endl;
 
     if (!res)
     {
@@ -2050,6 +2147,7 @@ int main(int argc, char** argv)
                                 id_header,
                                 setup_header,
                                 ++page_index, seg_index);
+        std::cout << "AudioDecode output " << res << std::endl;
     }
 
     std::cout << "ID header : " << std::endl
